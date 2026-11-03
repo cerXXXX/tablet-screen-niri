@@ -106,56 +106,67 @@ PluginComponent {
     }
 
     horizontalBarPill: Component {
-        StyledRect {
-            width: row.implicitWidth + Theme.spacingM * 2
-            height: parent.widgetThickness
-            radius: Theme.cornerRadius
-            color: root.isOn ? Theme.primary : Theme.surfaceContainerHigh
+        // BasePill sizes itself from the content's implicit size, so the root
+        // has to be an Item/Row that reports one. A Rectangle with an explicit
+        // `width` reports implicitWidth 0, which is why the old pill collapsed
+        // to padding and the text spilled out of it.
+        Item {
+            implicitWidth: row.implicitWidth
+            implicitHeight: row.implicitHeight
 
             Row {
                 id: row
                 anchors.centerIn: parent
-                spacing: Theme.spacingS
+                spacing: Theme.spacingXS
 
-                StyledText {
+                DankIcon {
+                    name: "tablet_mac"
+                    size: root.iconSize
+                    color: root.isOn ? Theme.primary : Theme.widgetIconColor
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "tablet_mac"
-                    font.family: "Material Symbols Outlined"
-                    font.pixelSize: Theme.fontSizeMedium
-                    color: root.isOn ? Theme.onPrimary : Theme.surfaceText
                 }
 
                 StyledText {
-                    anchors.verticalCenter: parent.verticalCenter
                     text: root.screenState === "absent" ? "—" : (root.isOn ? "on" : "off")
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: root.isOn ? Theme.onPrimary : Theme.surfaceText
+                    font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
+                    color: root.isOn ? Theme.primary : Theme.widgetTextColor
+                    anchors.verticalCenter: parent.verticalCenter
                 }
             }
         }
     }
 
     verticalBarPill: Component {
-        StyledRect {
-            width: parent.widgetThickness
-            height: row.implicitHeight + Theme.spacingM * 2
-            radius: Theme.cornerRadius
-            color: root.isOn ? Theme.primary : Theme.surfaceContainerHigh
+        Item {
+            implicitWidth: column.implicitWidth
+            implicitHeight: column.implicitHeight
 
-            StyledText {
+            Column {
+                id: column
                 anchors.centerIn: parent
-                text: "T"
-                font.pixelSize: Theme.fontSizeMedium
-                color: root.isOn ? Theme.onPrimary : Theme.surfaceText
+                spacing: 1
+
+                DankIcon {
+                    name: "tablet_mac"
+                    size: root.iconSize
+                    color: root.isOn ? Theme.primary : Theme.widgetIconColor
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
+
+                StyledText {
+                    text: root.screenState === "absent" ? "—" : (root.isOn ? "on" : "off")
+                    font.pixelSize: Theme.barTextSize(root.barThickness, root.barConfig?.fontScale, root.barConfig?.maximizeWidgetText)
+                    color: root.isOn ? Theme.primary : Theme.widgetTextColor
+                    anchors.horizontalCenter: parent.horizontalCenter
+                }
             }
         }
     }
 
-    pillClickAction: () => {
-        if (root.screenState === "absent")
-            return;
-        toggleProc.running = true;
-    }
+    // No pillClickAction on purpose: BasePill then opens the popout on click,
+    // which is where "what does this do" is answered (state, on/off, presets).
+    // With an action set, the popout was unreachable and the pill looked like
+    // it did nothing.
 
     popoutWidth: 400
     popoutHeight: 330
@@ -172,29 +183,33 @@ PluginComponent {
                 Row {
                     spacing: Theme.spacingM
 
-                    Repeater {
-                        model: root.isOn ? ["Turn off"] : ["Turn on"]
+                    StyledRect {
+                        id: toggleButton
+                        width: 120
+                        height: 34
+                        radius: Theme.cornerRadius
+                        color: root.screenState === "absent" ? Theme.surfaceContainerHigh : Theme.primary
 
-                        delegate: StyledRect {
-                            required property string modelData
-                            width: 120
-                            height: 34
-                            radius: Theme.cornerRadius
-                            color: Theme.primary
-
-                            StyledText {
-                                anchors.centerIn: parent
-                                text: parent.modelData
-                                color: Theme.onPrimary
-                                font.pixelSize: Theme.fontSizeSmall
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: toggleProc.running = true
-                            }
+                        StyledText {
+                            anchors.centerIn: parent
+                            text: root.screenState === "absent" ? "No tablet" : (root.isOn ? "Turn off" : "Turn on")
+                            color: root.screenState === "absent" ? Theme.surfaceVariantText : Theme.onPrimary
+                            font.pixelSize: Theme.fontSizeSmall
                         }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: root.screenState !== "absent"
+                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            onClicked: toggleProc.running = true
+                        }
+                    }
+
+                    StyledText {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.isOn ? "streaming" : "not streaming"
+                        color: root.isOn ? Theme.primary : Theme.surfaceVariantText
+                        font.pixelSize: Theme.fontSizeSmall
                     }
                 }
 
@@ -208,6 +223,7 @@ PluginComponent {
                     model: root.presets
 
                     delegate: StyledRect {
+                        id: presetRect
                         required property var modelData
                         width: parent.width
                         height: 40
@@ -236,7 +252,7 @@ PluginComponent {
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.run("uscreen config mode " + parent.modelData.spec)
+                            onClicked: root.run("uscreen config mode " + presetRect.modelData.spec)
                         }
                     }
                 }
