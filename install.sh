@@ -211,6 +211,9 @@ fi
 if [ "$do_restart" -eq 1 ]; then
     say "restarting the UScreen daemon"
     systemctl --user daemon-reload
+    # A daemon started by hand (for testing, or left over from an earlier run)
+    # owns the PID file, and the service refuses to start on top of it.
+    uscreen stop >/dev/null 2>&1 || true
     systemctl --user enable --now uscreen.service
     if systemctl --user is-active --quiet uscreen.service; then
         systemctl --user restart uscreen.service
