@@ -5,14 +5,12 @@ import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
 
-// Turns the tablet's second screen on and off.
+// The tablet screen's switch, its state and the presets that matter day to day.
 //
-// The daemon owns the output: it creates the virtual output when a tablet is
-// attached and this switch is on, and removes it otherwise, which is what
-// makes "off" cost nothing at all — no compositor rendering, no capture, no
-// encoder. Everything here is one command over that daemon's control socket
-// (`uscreen display on|off|toggle|status`), so the pill, a keybinding and a
-// script all drive the same switch.
+// There is no window and no tray icon behind this: the daemon is a service and
+// `uscreen display` / `uscreen config` is the whole interface. The pill shows
+// whether the virtual output currently exists, which is exactly "is anything
+// being rendered and encoded".
 PluginComponent {
     id: root
 
@@ -20,38 +18,38 @@ PluginComponent {
 
     // "on" / "off" / "absent" (no daemon, or no tablet plugged in)
     property string screenState: "absent"
+    property string mode: ""
+    property string bitrate: ""
 
     readonly property var presets: [
         {
             "label": "2400×1500 @ 60",
-            "width": 2400,
-            "height": 1500,
-            "fps": 60
+            "spec": "2400x1500@60",
+            "note": "default: keeps up, sharp"
         },
         {
             "label": "3000×1872 @ 50",
-            "width": 3000,
-            "height": 1872,
-            "fps": 50
+            "spec": "3000x1872@50",
+            "note": "native, 50 Hz"
         },
         {
             "label": "3000×1872 @ 60",
-            "width": 3000,
-            "height": 1872,
-            "fps": 60
+            "spec": "3000x1872@60",
+            "note": "native, encoder cannot keep up"
         }
     ]
 
     readonly property bool isOn: screenState === "on"
 
-    // Poll: the switch can be changed from anywhere (a keybinding, a script),
-    // and the daemon can change it by itself when the cable appears.
     Timer {
         interval: 3000
         running: true
         repeat: true
         triggeredOnStart: true
-        onTriggered: statusProc.running = true
+        onTriggered: {
+            statusProc.running = true;
+            configProc.running = true;
+        }
     }
 
     Process {
@@ -66,33 +64,45 @@ PluginComponent {
     }
 
     Process {
+        id: configProc
+        command: ["sh", "-c", "uscreen config 2>/dev/null"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                let width = "", height = "", fps = "", kbps = "";
+                for (const line of this.text.split("\n")) {
+                    const [key, value] = line.split("=").map(s => (s || "").trim());
+                    if (key === "width")
+                        width = value;
+                    else if (key === "height")
+                        height = value;
+                    else if (key === "fps")
+                        fps = value;
+                    else if (key === "bitrate")
+                        kbps = value;
+                }
+                root.mode = width ? (width + "×" + height + " @ " + fps) : "";
+                root.bitrate = kbps;
+            }
+        }
+    }
+
+    Process {
         id: toggleProc
         command: ["uscreen", "display", "toggle"]
         onExited: statusProc.running = true
     }
 
     Process {
-        id: presetProc
+        id: actionProc
         onExited: {
-            root.screenState = "off";
-            refreshTimer.running = true;
+            statusProc.running = true;
+            configProc.running = true;
         }
     }
 
-    Timer {
-        id: refreshTimer
-        interval: 4000
-        onTriggered: statusProc.running = true
-    }
-
-    function applyPreset(preset) {
-        const cfg = "$HOME/tablet-screen/tools/uscreen-config.py";
-        presetProc.command = ["sh", "-c", cfg + " set auto_resolution false && " + cfg + " set width " + preset.width + " && " + cfg + " set height " + preset.height + " && " + cfg + " set fps " + preset.fps + " && systemctl --user restart uscreen"];
-        presetProc.running = true;
-    }
-
-    function openSettings() {
-        Quickshell.execDetached(["uscreen-gui"]);
+    function run(command) {
+        actionProc.command = ["sh", "-c", command];
+        actionProc.running = true;
     }
 
     horizontalBarPill: Component {
@@ -109,7 +119,7 @@ PluginComponent {
 
                 StyledText {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root.isOn ? "tablet_mac" : "tablet_mac"
+                    text: "tablet_mac"
                     font.family: "Material Symbols Outlined"
                     font.pixelSize: Theme.fontSizeMedium
                     color: root.isOn ? Theme.onPrimary : Theme.surfaceText
@@ -147,13 +157,13 @@ PluginComponent {
         toggleProc.running = true;
     }
 
-    popoutWidth: 380
-    popoutHeight: 340
+    popoutWidth: 400
+    popoutHeight: 330
 
     popoutContent: Component {
         PopoutComponent {
             headerText: "Tablet screen"
-            detailsText: root.screenState === "absent" ? "no tablet attached (or the daemon is not running)" : ("virtual output is " + (root.isOn ? "on" : "off"))
+            detailsText: root.screenState === "absent" ? "no tablet attached (or the daemon is not running)" : (root.mode + (root.bitrate ? " · " + (root.bitrate / 1000) + " Mbps" : ""))
 
             Column {
                 width: parent.width
@@ -162,49 +172,34 @@ PluginComponent {
                 Row {
                     spacing: Theme.spacingM
 
-                    StyledRect {
-                        width: 110
-                        height: 34
-                        radius: Theme.cornerRadius
-                        color: root.isOn ? Theme.primary : Theme.surfaceContainerHigh
+                    Repeater {
+                        model: root.isOn ? ["Turn off"] : ["Turn on"]
 
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: root.isOn ? "Turn off" : "Turn on"
-                            color: root.isOn ? Theme.onPrimary : Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeSmall
-                        }
+                        delegate: StyledRect {
+                            required property string modelData
+                            width: 120
+                            height: 34
+                            radius: Theme.cornerRadius
+                            color: Theme.primary
 
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: toggleProc.running = true
-                        }
-                    }
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: parent.modelData
+                                color: Theme.onPrimary
+                                font.pixelSize: Theme.fontSizeSmall
+                            }
 
-                    StyledRect {
-                        width: 110
-                        height: 34
-                        radius: Theme.cornerRadius
-                        color: Theme.surfaceContainerHigh
-
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: "Settings…"
-                            color: Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeSmall
-                        }
-
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.openSettings()
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: toggleProc.running = true
+                            }
                         }
                     }
                 }
 
                 StyledText {
-                    text: "Resolution (restarts the stream)"
+                    text: "Mode (applied live)"
                     color: Theme.surfaceVariantText
                     font.pixelSize: Theme.fontSizeSmall
                 }
@@ -215,23 +210,33 @@ PluginComponent {
                     delegate: StyledRect {
                         required property var modelData
                         width: parent.width
-                        height: 32
+                        height: 40
                         radius: Theme.cornerRadius
                         color: Theme.surfaceContainerHigh
 
-                        StyledText {
+                        Column {
                             anchors.left: parent.left
                             anchors.leftMargin: Theme.spacingM
                             anchors.verticalCenter: parent.verticalCenter
-                            text: parent.modelData.label
-                            color: Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeSmall
+                            spacing: 2
+
+                            StyledText {
+                                text: parent.parent.modelData.label
+                                color: Theme.surfaceText
+                                font.pixelSize: Theme.fontSizeSmall
+                            }
+
+                            StyledText {
+                                text: parent.parent.modelData.note
+                                color: Theme.surfaceVariantText
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                            }
                         }
 
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: root.applyPreset(parent.modelData)
+                            onClicked: root.run("uscreen config mode " + parent.modelData.spec)
                         }
                     }
                 }

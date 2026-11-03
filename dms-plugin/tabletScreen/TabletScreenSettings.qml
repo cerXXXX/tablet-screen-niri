@@ -5,195 +5,265 @@ import qs.Common
 import qs.Widgets
 import qs.Modules.Plugins
 
-// Only the settings this widget is responsible for: which capture backend the
-// daemon uses, where the tablet sits, and how much bandwidth the encoder may
-// spend. Everything else (per-tablet profiles, pen mapping, the port numbers)
-// stays in UScreen's own window, which this page links to rather than copies.
+// Everything the daemon can change, in the one place that shows it.
+//
+// Each control writes through `uscreen config set`, which applies the change to
+// the running pipeline over the daemon's control socket — no restart, no black
+// frame, no config file to edit by hand. The values shown are read back from
+// the daemon, so the page never disagrees with what is actually running.
 PluginSettings {
     id: root
     pluginId: "tabletScreen"
 
-    readonly property string configTool: "$HOME/tablet-screen/tools/uscreen-config.py"
+    property var values: ({})
+    property string lastError: ""
 
-    property string currentValues: ""
+    readonly property var bitrates: [15000, 20000, 25000, 35000, 50000]
+    readonly property var scales: ["1.0", "1.25", "1.5", "1.75", "2.0"]
 
     Timer {
         interval: 4000
         running: true
         repeat: true
         triggeredOnStart: true
-        onTriggered: showProc.running = true
+        onTriggered: readProc.running = true
     }
 
     Process {
-        id: showProc
-        command: ["sh", "-c", root.configTool + " show 2>/dev/null"]
+        id: readProc
+        command: ["sh", "-c", "uscreen config 2>/dev/null"]
         stdout: StdioCollector {
-            onStreamFinished: root.currentValues = this.text
+            onStreamFinished: {
+                const out = {};
+                for (const line of this.text.split("\n")) {
+                    const at = line.indexOf("=");
+                    if (at < 0)
+                        continue;
+                    out[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+                }
+                if (Object.keys(out).length > 0)
+                    root.values = out;
+            }
         }
     }
 
     Process {
-        id: setProc
-        onExited: showProc.running = true
+        id: writeProc
+        stderr: StdioCollector {
+            onStreamFinished: root.lastError = this.text.trim()
+        }
+        onExited: readProc.running = true
     }
 
-    function setKey(key, value) {
-        setProc.command = ["sh", "-c", root.configTool + " set " + key + " " + value + " && systemctl --user restart uscreen"];
-        setProc.running = true;
+    function set(key, value) {
+        writeProc.command = ["uscreen", "config", "set", key, String(value)];
+        writeProc.running = true;
     }
 
-    function current(key) {
-        const line = root.currentValues.split("\n").find(l => l.startsWith(key + " = "));
-        return line ? line.slice(key.length + 3).trim() : "";
+    function run(args) {
+        writeProc.command = ["uscreen", "config"].concat(args);
+        writeProc.running = true;
+    }
+
+    function value(key, fallback) {
+        return root.values[key] !== undefined ? root.values[key] : fallback;
+    }
+
+    // A row of choices; the active one is highlighted. `key` empty means the
+    // choice is a whole mode (`uscreen config mode WxH@FPS`) rather than one
+    // key.
+    component Choices: Row {
+        id: choices
+
+        property string label: ""
+        property string key: ""
+        property var options: []
+        property var labels: options
+
+        spacing: Theme.spacingS
+
+        StyledText {
+            anchors.verticalCenter: parent.verticalCenter
+            width: 110
+            text: choices.label
+            color: Theme.surfaceVariantText
+            font.pixelSize: Theme.fontSizeSmall
+        }
+
+        Repeater {
+            model: choices.options
+
+            delegate: StyledRect {
+                id: chipRect
+                required property var modelData
+                required property int index
+
+                readonly property bool active: choices.key === ""
+                    ? (root.value("width", "") + "x" + root.value("height", "") + "@" + root.value("fps", "")) === String(modelData)
+                    : String(root.value(choices.key, "")) === String(modelData)
+
+                width: Math.max(46, chip.implicitWidth + Theme.spacingM)
+                height: 30
+                radius: Theme.cornerRadius
+                color: chipRect.active ? Theme.primary : Theme.surfaceContainerHigh
+
+                StyledText {
+                    id: chip
+                    anchors.centerIn: parent
+                    text: String(choices.labels[chipRect.index])
+                    color: chipRect.active ? Theme.onPrimary : Theme.surfaceText
+                    font.pixelSize: Theme.fontSizeSmall
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (choices.key === "")
+                            root.run(["mode", String(chipRect.modelData)]);
+                        else
+                            root.set(choices.key, chipRect.modelData);
+                    }
+                }
+            }
+        }
+    }
+
+    // A number with − and +; step is per key.
+    component Stepper: Row {
+        id: stepper
+
+        property string label: ""
+        property string key: ""
+        property real step: 1
+        property real minimum: 0
+        property real maximum: 100000
+
+        spacing: Theme.spacingS
+
+        StyledText {
+            anchors.verticalCenter: parent.verticalCenter
+            width: 110
+            text: stepper.label
+            color: Theme.surfaceVariantText
+            font.pixelSize: Theme.fontSizeSmall
+        }
+
+        Repeater {
+            model: ["−", "+"]
+
+            delegate: StyledRect {
+                id: stepRect
+                required property string modelData
+
+                width: 34
+                height: 30
+                radius: Theme.cornerRadius
+                color: Theme.surfaceContainerHigh
+
+                StyledText {
+                    anchors.centerIn: parent
+                    text: stepRect.modelData
+                    color: Theme.surfaceText
+                    font.pixelSize: Theme.fontSizeMedium
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        const current = Number(root.value(stepper.key, 0));
+                        const delta = stepRect.modelData === "+" ? stepper.step : -stepper.step;
+                        const next = Math.min(stepper.maximum, Math.max(stepper.minimum, current + delta));
+                        root.set(stepper.key, next);
+                    }
+                }
+            }
+        }
+
+        StyledText {
+            anchors.verticalCenter: parent.verticalCenter
+            width: 70
+            text: String(root.value(stepper.key, ""))
+            color: Theme.surfaceText
+            font.pixelSize: Theme.fontSizeSmall
+        }
     }
 
     Column {
         width: parent.width
-        spacing: Theme.spacingL
-
-        StyledText {
-            text: "Capture backend"
-            color: Theme.surfaceText
-            font.pixelSize: Theme.fontSizeMedium
-            font.weight: Font.Medium
-        }
+        spacing: Theme.spacingM
 
         StyledText {
             width: parent.width
-            text: "wayland is the zero-copy path: the compositor hands out its own GPU buffers and the iGPU encodes them (~8% of one core, 60 fps at 2400×1500). evdi is the old path through a kernel virtual display and a CPU copy."
+            text: "The tablet screen is a virtual output the daemon creates on demand. Turning it off removes the output, so nothing is rendered, captured or encoded while it is not in use."
             color: Theme.surfaceVariantText
             font.pixelSize: Theme.fontSizeSmall
             wrapMode: Text.WordWrap
         }
 
-        Row {
-            spacing: Theme.spacingM
+        Choices {
+            label: "Capture"
+            key: "capture"
+            options: ["wayland", "evdi"]
+            labels: ["DMA-BUF", "EVDI (old)"]
+        }
 
-            Repeater {
-                model: ["wayland", "evdi"]
+        Choices {
+            label: "Side"
+            key: "position"
+            options: ["right", "left", "above", "below"]
+        }
 
-                delegate: StyledRect {
-                    required property string modelData
-                    width: 120
-                    height: 34
-                    radius: Theme.cornerRadius
-                    color: root.current("capture").includes(modelData) ? Theme.primary : Theme.surfaceContainerHigh
+        Choices {
+            label: "Scale"
+            key: "scale"
+            options: root.scales
+        }
 
-                    StyledText {
-                        anchors.centerIn: parent
-                        text: parent.modelData
-                        color: parent.color === Theme.primary ? Theme.onPrimary : Theme.surfaceText
-                        font.pixelSize: Theme.fontSizeSmall
-                    }
+        Choices {
+            label: "Cursor"
+            key: "cursor"
+            options: ["true", "false"]
+            labels: ["shown", "hidden"]
+        }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.setKey("capture", parent.modelData)
-                    }
-                }
-            }
+        Choices {
+            label: "Mode"
+            options: ["2400x1500@60", "3000x1872@50", "3000x1872@60"]
+            labels: ["2400×1500", "3000×1872 @50", "3000×1872 @60"]
         }
 
         StyledText {
-            text: "Side of the desktop"
+            text: "Bitrate and quality"
             color: Theme.surfaceText
             font.pixelSize: Theme.fontSizeMedium
             font.weight: Font.Medium
         }
 
-        Row {
-            spacing: Theme.spacingM
-
-            Repeater {
-                model: ["right", "left", "above", "below"]
-
-                delegate: StyledRect {
-                    required property string modelData
-                    width: 80
-                    height: 34
-                    radius: Theme.cornerRadius
-                    color: root.current("position").includes(modelData) ? Theme.primary : Theme.surfaceContainerHigh
-
-                    StyledText {
-                        anchors.centerIn: parent
-                        text: parent.modelData
-                        color: parent.color === Theme.primary ? Theme.onPrimary : Theme.surfaceText
-                        font.pixelSize: Theme.fontSizeSmall
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.setKey("position", parent.modelData)
-                    }
-                }
-            }
+        Stepper {
+            label: "Bitrate (kbps)"
+            key: "bitrate"
+            step: 5000
+            minimum: 5000
+            maximum: 60000
         }
 
-        StyledText {
-            text: "Bitrate"
-            color: Theme.surfaceText
-            font.pixelSize: Theme.fontSizeMedium
-            font.weight: Font.Medium
+        Stepper {
+            label: "Quality (qp)"
+            key: "quality"
+            step: 1
+            minimum: 12
+            maximum: 32
         }
 
         StyledText {
             width: parent.width
-            text: "Measured ceiling on this laptop is ~275 Mbps over USB, so bitrate is never the limit: 20 Mbps is enough for a sharp 2400×1500 desktop, 35 for native 3000×1872."
-            color: Theme.surfaceVariantText
+            visible: root.lastError !== ""
+            text: root.lastError
+            color: Theme.error
             font.pixelSize: Theme.fontSizeSmall
             wrapMode: Text.WordWrap
-        }
-
-        Row {
-            spacing: Theme.spacingM
-
-            Repeater {
-                model: [20000, 35000, 50000]
-
-                delegate: StyledRect {
-                    required property int modelData
-                    width: 100
-                    height: 34
-                    radius: Theme.cornerRadius
-                    color: root.current("bitrate") === String(modelData) ? Theme.primary : Theme.surfaceContainerHigh
-
-                    StyledText {
-                        anchors.centerIn: parent
-                        text: (parent.modelData / 1000) + " Mbps"
-                        color: parent.color === Theme.primary ? Theme.onPrimary : Theme.surfaceText
-                        font.pixelSize: Theme.fontSizeSmall
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.setKey("bitrate", parent.modelData)
-                    }
-                }
-            }
-        }
-
-        StyledRect {
-            width: 200
-            height: 34
-            radius: Theme.cornerRadius
-            color: Theme.surfaceContainerHigh
-
-            StyledText {
-                anchors.centerIn: parent
-                text: "Open UScreen window…"
-                color: Theme.surfaceText
-                font.pixelSize: Theme.fontSizeSmall
-            }
-
-            MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: Quickshell.execDetached(["uscreen-gui"])
-            }
         }
     }
 }

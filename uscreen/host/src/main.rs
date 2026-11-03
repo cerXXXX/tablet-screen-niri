@@ -114,6 +114,12 @@ enum Commands {
         /// on, off, toggle (default) or status
         action: Option<String>,
     },
+    /// Read or change settings on the running daemon (no restart)
+    Config {
+        /// get, `set KEY VALUE`, or `mode WxH@FPS`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -134,6 +140,14 @@ async fn main() -> Result<()> {
         Some(Commands::Display { action }) => {
             let action = action.clone().unwrap_or_else(|| "toggle".into());
             println!("{}", ctl::request(&action).await?);
+        }
+        Some(Commands::Config { args }) => {
+            let request = if args.is_empty() {
+                String::from("config get")
+            } else {
+                format!("config {}", args.join(" "))
+            };
+            println!("{}", ctl::request(&request).await?);
         }
     }
 
@@ -376,7 +390,7 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     // manager already knows how to raise and tear down the display on this
     // signal, and cannot tell the difference between an unplugged tablet and
     // one that is currently a drawing surface.
-    ctl::spawn_server();
+    ctl::spawn_server(settings_tx.clone());
     let (gate_tx, gate_rx) = watch::channel(false);
     let mut display_rx_gate = ctl::display();
     let mut mode_rx_gate = mode_tx.subscribe();
@@ -516,9 +530,15 @@ async fn run_daemon(cli: Cli) -> Result<()> {
 
     let tray_mode_tx = mode_tx.clone();
     let tray_shutdown_tx = shutdown_tx.clone();
-    let tray_handle = tokio::spawn(async move {
-        tray::run(tray_mode_tx, tray_tablet_rx, tray_shutdown_tx, update_rx).await;
-    });
+    let tray_handle = if file_cfg.tray.unwrap_or(false) {
+        Some(tokio::spawn(async move {
+            tray::run(tray_mode_tx, tray_tablet_rx, tray_shutdown_tx, update_rx).await;
+        }))
+    } else {
+        // The DMS widget is the interface; an extra tray icon would just say
+        // the same thing twice.
+        None
+    };
 
     // Plug-and-play: watch for the tablet over ADB, set up port forwarding
     // and launch the app whenever it's (re)connected.
@@ -605,7 +625,9 @@ async fn run_daemon(cli: Cli) -> Result<()> {
     adb_handle.abort();
     save_handle.abort();
     mode_save_handle.abort();
-    tray_handle.abort();
+    if let Some(h) = tray_handle {
+        h.abort();
+    }
     if let Some(h) = update_handle {
         h.abort();
     }

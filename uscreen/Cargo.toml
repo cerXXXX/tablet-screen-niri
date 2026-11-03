@@ -1,3 +1,3 @@
 [workspace]
-members = ["host", "gui"]
+members = ["host"]
 resolver = "2"

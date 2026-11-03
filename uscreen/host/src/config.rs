@@ -103,6 +103,9 @@ pub struct FileConfig {
     /// Logical scale for that output: a number, or "auto" (the default) for
     /// the daemon's own pick based on the mode.
     pub scale: Option<String>,
+    /// Show a StatusNotifier (tray) icon. Off by default: the DMS widget is
+    /// the interface, and a second icon saying the same thing is noise.
+    pub tray: Option<bool>,
     /// Ask the compositor to draw the mouse cursor into the captured frames.
     /// Off makes the pointer invisible on the tablet (clicks still work).
     pub cursor: Option<bool>,
@@ -186,6 +189,7 @@ impl Default for FileConfig {
             output_name: None,
             scale: None,
             cursor: None,
+            tray: None,
         }
     }
 }

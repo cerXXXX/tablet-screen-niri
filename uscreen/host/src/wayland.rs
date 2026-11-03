@@ -60,6 +60,22 @@ pub async fn stream_frames(
 
         let settings = settings_rx.borrow_and_update().clone();
 
+        // Re-read the structural keys from the file: they are changed through
+        // `uscreen config set`, which only re-sends the settings, and this loop
+        // is where a structural change lands (it rebuilds the pipeline).
+        let file = crate::config::FileConfig::load();
+        let mut cfg = cfg.clone();
+        cfg.output = file
+            .output_name
+            .clone()
+            .unwrap_or_else(|| cfg.output.clone());
+        cfg.position = crate::config::Position::parse_or_default(&file.position);
+        cfg.cursor = file.cursor.unwrap_or(true);
+        cfg.virtual_output = matches!(
+            file.capture.as_deref(),
+            Some("wayland") | Some("dmabuf") | Some("dmabuf-wayland")
+        ) || cfg.virtual_output;
+
         // No tablet is being used as a screen: the output must not exist, so
         // that nothing is rendered or encoded while the user is not looking.
         if !*display_rx.borrow() {

@@ -20,8 +20,8 @@
 pkgname=uscreen-dmabuf
 _pkgname=uscreen
 pkgver=1.2.12
-pkgrel=2
-pkgdesc="Android tablet as a USB second display (fork: DMA-BUF capture and niri virtual outputs, no CPU copy)"
+pkgrel=3
+pkgdesc="Android tablet as a USB second display (fork: DMA-BUF capture, niri virtual outputs, no GUI or tray)"
 arch=('x86_64')
 url="https://github.com/majmichu1/UScreen"
 license=('MIT')
@@ -40,17 +40,13 @@ build() {
   # The EVDI fallback helper, against the system libevdi that evdi-dkms ships.
   gcc -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c host/evdi/uscreen_convert.c \
       -levdi -lpthread -Ihost/evdi
-  cargo build --release --locked -p uscreen -p uscreen-gui
+  cargo build --release --locked -p uscreen
 }
 
 package() {
   cd "$startdir"
   install -Dm755 target/release/uscreen     "$pkgdir/usr/bin/uscreen"
-  install -Dm755 target/release/uscreen-gui "$pkgdir/usr/bin/uscreen-gui"
   install -Dm755 host/evdi/evdi_helper      "$pkgdir/usr/lib/uscreen/evdi_helper"
-  install -Dm644 scripts/uscreen.desktop    "$pkgdir/usr/share/applications/uscreen.desktop"
-  install -Dm644 packaging/icons/uscreen.svg     "$pkgdir/usr/share/icons/hicolor/scalable/apps/uscreen.svg"
-  install -Dm644 packaging/icons/uscreen-pen.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/uscreen-pen.svg"
   install -Dm644 packaging/uscreen.service  "$pkgdir/usr/lib/systemd/user/uscreen.service"
   install -Dm644 packaging/uscreen-evdi.conf "$pkgdir/usr/lib/modprobe.d/uscreen-evdi.conf"
   install -Dm644 packaging/uscreen-modules.conf "$pkgdir/usr/lib/modules-load.d/uscreen.conf"

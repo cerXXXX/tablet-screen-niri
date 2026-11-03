@@ -122,10 +122,21 @@ only, over USB tethering, stylus not documented.
 around Sunshine + Moonlight over USB tethering; a dummy plug for a true
 extended display, pressure but no tilt.
 
+## Packaging
+
+`PKGBUILD` in this directory is the only packager here and it builds from this
+checkout. Upstream's `packaging/` release scripts (deb, rpm, and its own Arch
+PKGBUILD) were removed with the GUI they packaged; the files they shared
+(`uscreen.service`, the modprobe/modules-load configs, the udev rule, the icons)
+are still used by `PKGBUILD`.
+
 ## Settings
 
-Everything lives in `~/.config/uscreen/config.toml` and is reachable from
-`uscreen-gui`, the ⚙ sheet in the tablet app, the tray icon, or CLI flags.
+Everything lives in `~/.config/uscreen/config.toml` and is changed through
+`uscreen config` (read and written over the daemon's control socket, applied to
+the running pipeline without a restart), from the ⚙ sheet in the tablet app, or
+by editing the file. This fork has no settings window and no tray icon: the DMS
+widget in the tablet-screen-niri repository is the interface.
 
 - **Graphics tablet mode** — flip *Graphics tablet* on the tablet: nothing is
   streamed, the pen drives your own screen, zero display latency. Switch back

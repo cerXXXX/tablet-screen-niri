@@ -26,7 +26,7 @@ niri ── virtual output "tablet" ──┐
 | пакет / файл | что это |
 |---|---|
 | `niri-lock-wallpaper-tablet` | niri из main **с двумя патчами**: обои под прозрачным локскрином + виртуальные выходы (`niri msg create-virtual-output`) |
-| `uscreen-dmabuf` | форк UScreen: захват DMA-BUF композитора и кодирование на iGPU; старый путь через EVDI остался как `capture = "evdi"` |
+| `uscreen-dmabuf` | форк UScreen: захват DMA-BUF композитора и кодирование на iGPU; **без окна и без трея** — единственный интерфейс это виджет DMS; старый путь через EVDI остался как `capture = "evdi"` |
 | `dms-plugin/tabletScreen` | виджет DMS: пилюля в баре, тумблер, пресеты разрешения |
 | `input { touch/tablet { map-to-output } }` в `config.kdl` | без этого тач и перо уезжают на сфокусированный экран |
 
@@ -72,14 +72,19 @@ docs/NOTES.md              журнал замеров и решений
 ## Управление
 
 ```bash
-uscreen display status      # on / off / нет демона
-uscreen display toggle      # выключить/включить экран (выход создаётся и удаляется)
-uscreen doctor              # диагностика: niri, VAAPI, adb, устройства ввода
-uscreen-gui                 # окно настроек (кодировщик, качество, профили планшета)
+uscreen display on|off|toggle|status   # экран: выход создаётся и удаляется
+uscreen config                        # все настройки, key = value
+uscreen config set bitrate 25000      # применяется на ходу, без рестарта
+uscreen config mode 2400x1500@60      # размер и Гц выхода (+ в профилях планшетов)
+uscreen doctor                        # диагностика: niri, VAAPI, adb, ввод
 ```
 
-Виджет в баре DMS делает то же самое плюс пресеты разрешения
-(2400×1500@60 — дефолт, 3000×1872@50, 3000×1872@60).
+Виджет в баре DMS — **единственный интерфейс**: тумблер, текущий режим и все
+настройки (backend, сторона, scale, курсор, режим, битрейт, качество). Он ходит
+через `uscreen config`, поэтому изменения применяются к работающему пайплайну
+сразу — без `systemctl restart` и без чёрного кадра. Окна настроек и иконки в
+трее в этом форке нет; демон — обычный user-сервис, который видно только в
+`journalctl --user -u uscreen`.
 
 Ключи конфига `~/.config/uscreen/config.toml`, которые важны здесь:
 

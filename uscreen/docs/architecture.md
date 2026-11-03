@@ -34,8 +34,10 @@
 - `uscreen` — the daemon: adb monitor, per-tablet sessions, tray icon, config.
 - `evdi_helper` — one per tablet slot, owns one EVDI card.
 - `ffmpeg` — one per slot (unless built with the in-process encoder).
-- `uscreen-gui` — optional settings window, talks to the daemon through the
-  config file and the PID file.
+- The settings window was removed in this fork: there is no window and no tray
+  icon. The daemon takes commands on a control socket instead
+  (`uscreen display …`, `uscreen config …`), which is what the DMS widget and
+  any script drive.
 
 ## Protocol
 
