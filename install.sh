@@ -161,6 +161,25 @@ PY
         niri_updated=1
     fi
 
+    # Keys this fork needs are ensured one by one, not only when the file is
+    # missing: the stock uscreen rewrites config.toml whenever it saves
+    # settings, and it knows nothing about these keys — running it once (for
+    # example while both packages were installed) silently dropped them, and
+    # the daemon then fell back to the EVDI path.
+    if [ -x "$here/tools/uscreen-config.py" ] && [ -f "$uscreen_config" ]; then
+        ensure_key() {
+            if ! "$here/tools/uscreen-config.py" get "$1" >/dev/null 2>&1; then
+                say "config: adding $1 = $2 to $(basename "$uscreen_config")"
+                "$here/tools/uscreen-config.py" set "$1" "$2"
+            fi
+        }
+        ensure_key capture wayland
+        ensure_key output_name tablet
+        ensure_key scale 1.5
+        ensure_key cursor true
+        ensure_key auto_resolution false
+    fi
+
     if [ ! -f "$uscreen_config" ]; then
         say "writing a default $uscreen_config"
         mkdir -p "$(dirname "$uscreen_config")"
