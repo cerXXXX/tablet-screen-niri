@@ -34,7 +34,7 @@ PluginComponent {
     readonly property var scaleChoices: ["1.0", "1.25", "1.5", "1.75", "2.0"]
 
     readonly property var presets: [
-        { "label": "2400×1500", "spec": "2400x1500@60" },
+        { "label": "2400×1500 @60", "spec": "2400x1500@60" },
         { "label": "3000×1872 @50", "spec": "3000x1872@50" },
         { "label": "3000×1872 @60", "spec": "3000x1872@60" }
     ]
