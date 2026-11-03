@@ -199,12 +199,33 @@ pub async fn enable_output(names: &[String], position: crate::config::Position) 
         };
         if mon.is_on() {
             // Already up: leave it alone, except for a scale the user pinned
-            // in the config file, which the compositor cannot know about.
-            if let Some(want) = configured_scale() {
-                if (mon.scale - want).abs() > 0.01 {
-                    info!("setting {} scale to {}", mon.name, want);
-                    run(&["output", &mon.name, "scale", &format!("{want}")]).await;
-                }
+            // in the config file, which the compositor cannot know about, and
+            // the side it should sit on. Position used to be applied only on
+            // the switch-on path below, so changing it while the output was
+            // on did nothing until it was turned off and on again.
+            let want_scale = configured_scale().unwrap_or(mon.scale);
+            if (mon.scale - want_scale).abs() > 0.01 {
+                info!("setting {} scale to {}", mon.name, want_scale);
+                run(&["output", &mon.name, "scale", &format!("{want_scale}")]).await;
+            }
+            let mode = mon
+                .best_mode
+                .unwrap_or((mon.width as u32, mon.height as u32));
+            let (x, y) = place_on(&all, &mon.name, mode, want_scale, position);
+            if (mon.x - x).abs() > 0.5 || (mon.y - y).abs() > 0.5 {
+                info!("placing {} at {},{} ({:?})", mon.name, x, y, position);
+                run(&[
+                    "output",
+                    &mon.name,
+                    "position",
+                    "set",
+                    // `--` so clap does not take a negative coordinate for a
+                    // flag: left/above place the output at -1600 or -1000.
+                    "--",
+                    &format!("{x}"),
+                    &format!("{y}"),
+                ])
+                .await;
             }
             return;
         }
@@ -228,6 +249,8 @@ pub async fn enable_output(names: &[String], position: crate::config::Position) 
             &name,
             "position",
             "set",
+            // See above: negative coordinates need the end-of-options marker.
+            "--",
             &format!("{x}"),
             &format!("{y}"),
         ])

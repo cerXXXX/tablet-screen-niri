@@ -20,7 +20,7 @@
 pkgname=uscreen-dmabuf
 _pkgname=uscreen
 pkgver=1.2.12
-pkgrel=4
+pkgrel=5
 pkgdesc="Android tablet as a USB second display (fork: DMA-BUF capture, niri virtual outputs, no GUI or tray)"
 arch=('x86_64')
 url="https://github.com/majmichu1/UScreen"
