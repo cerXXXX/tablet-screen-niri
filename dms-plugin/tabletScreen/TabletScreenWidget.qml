@@ -19,24 +19,24 @@ PluginComponent {
     // "on" / "off" / "absent" (no daemon, or no tablet plugged in)
     property string screenState: "absent"
     property string mode: ""
+    property string modeSpec: ""
     property string bitrate: ""
+    property string side: ""
+    property string scaleValue: ""
+
+    readonly property var sides: [
+        { "label": "Left", "value": "left" },
+        { "label": "Right", "value": "right" },
+        { "label": "Above", "value": "above" },
+        { "label": "Below", "value": "below" }
+    ]
+
+    readonly property var scaleChoices: ["1.0", "1.25", "1.5", "1.75", "2.0"]
 
     readonly property var presets: [
-        {
-            "label": "2400×1500 @ 60",
-            "spec": "2400x1500@60",
-            "note": "default: keeps up, sharp"
-        },
-        {
-            "label": "3000×1872 @ 50",
-            "spec": "3000x1872@50",
-            "note": "native, 50 Hz"
-        },
-        {
-            "label": "3000×1872 @ 60",
-            "spec": "3000x1872@60",
-            "note": "native, encoder cannot keep up"
-        }
+        { "label": "2400×1500", "spec": "2400x1500@60" },
+        { "label": "3000×1872 @50", "spec": "3000x1872@50" },
+        { "label": "3000×1872 @60", "spec": "3000x1872@60" }
     ]
 
     readonly property bool isOn: screenState === "on"
@@ -68,7 +68,7 @@ PluginComponent {
         command: ["sh", "-c", "uscreen config 2>/dev/null"]
         stdout: StdioCollector {
             onStreamFinished: {
-                let width = "", height = "", fps = "", kbps = "";
+                let width = "", height = "", fps = "", kbps = "", position = "", scale = "";
                 for (const line of this.text.split("\n")) {
                     const [key, value] = line.split("=").map(s => (s || "").trim());
                     if (key === "width")
@@ -79,9 +79,16 @@ PluginComponent {
                         fps = value;
                     else if (key === "bitrate")
                         kbps = value;
+                    else if (key === "position")
+                        position = value;
+                    else if (key === "scale")
+                        scale = value;
                 }
                 root.mode = width ? (width + "×" + height + " @ " + fps) : "";
+                root.modeSpec = width ? (width + "x" + height + "@" + fps) : "";
                 root.bitrate = kbps;
+                root.side = position;
+                root.scaleValue = scale;
             }
         }
     }
@@ -168,13 +175,41 @@ PluginComponent {
     // With an action set, the popout was unreachable and the pill looked like
     // it did nothing.
 
+    component ChoiceChip: StyledRect {
+        id: chip
+
+        property string label: ""
+        property bool active: false
+        signal picked
+
+        width: Math.max(44, chipLabel.implicitWidth + Theme.spacingM * 1.5)
+        height: 30
+        radius: Theme.cornerRadius
+        color: chip.active ? Theme.primary : Theme.surfaceContainerHigh
+
+        StyledText {
+            id: chipLabel
+            anchors.centerIn: parent
+            text: chip.label
+            color: chip.active ? Theme.onPrimary : Theme.surfaceText
+            font.pixelSize: Theme.fontSizeSmall
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: chip.picked()
+        }
+    }
+
     popoutWidth: 400
-    popoutHeight: 330
 
     popoutContent: Component {
         PopoutComponent {
             headerText: "Tablet screen"
-            detailsText: root.screenState === "absent" ? "no tablet attached (or the daemon is not running)" : (root.mode + (root.bitrate ? " · " + (root.bitrate / 1000) + " Mbps" : ""))
+            detailsText: root.screenState === "absent"
+                ? "No tablet attached"
+                : root.mode + (root.bitrate ? " · " + (root.bitrate / 1000) + " Mbps" : "")
 
             Column {
                 width: parent.width
@@ -184,9 +219,8 @@ PluginComponent {
                     spacing: Theme.spacingM
 
                     StyledRect {
-                        id: toggleButton
-                        width: 120
-                        height: 34
+                        width: 110
+                        height: 32
                         radius: Theme.cornerRadius
                         color: root.screenState === "absent" ? Theme.surfaceContainerHigh : Theme.primary
 
@@ -207,64 +241,86 @@ PluginComponent {
 
                     StyledText {
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.isOn ? "streaming" : "not streaming"
+                        text: root.isOn ? "Streaming" : (root.screenState === "absent" ? "" : "Off")
                         color: root.isOn ? Theme.primary : Theme.surfaceVariantText
                         font.pixelSize: Theme.fontSizeSmall
                     }
                 }
 
-                StyledText {
+                Column {
                     width: parent.width
-                    text: root.screenState === "absent"
-                        ? "Connect the tablet over USB and open the UScreen app on it."
-                        : (root.isOn
-                            ? "The tablet is a virtual output: windows can be moved to it and touch/pen follow it."
-                            : "The virtual output is removed. Nothing is rendered, captured or sent until it is turned on again.")
-                    color: Theme.surfaceVariantText
-                    font.pixelSize: Theme.fontSizeSmall
-                    wrapMode: Text.WordWrap
-                }
+                    spacing: Theme.spacingS
 
-                StyledText {
-                    text: "Mode (applied live)"
-                    color: Theme.surfaceVariantText
-                    font.pixelSize: Theme.fontSizeSmall
-                }
+                    StyledText {
+                        text: "Side"
+                        color: Theme.surfaceVariantText
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
 
-                Repeater {
-                    model: root.presets
+                    Row {
+                        spacing: Theme.spacingS
 
-                    delegate: StyledRect {
-                        id: presetRect
-                        required property var modelData
-                        width: parent.width
-                        height: 40
-                        radius: Theme.cornerRadius
-                        color: Theme.surfaceContainerHigh
+                        Repeater {
+                            model: root.sides
 
-                        Column {
-                            anchors.left: parent.left
-                            anchors.leftMargin: Theme.spacingM
-                            anchors.verticalCenter: parent.verticalCenter
-                            spacing: 2
-
-                            StyledText {
-                                text: parent.parent.modelData.label
-                                color: Theme.surfaceText
-                                font.pixelSize: Theme.fontSizeSmall
-                            }
-
-                            StyledText {
-                                text: parent.parent.modelData.note
-                                color: Theme.surfaceVariantText
-                                font.pixelSize: Theme.fontSizeSmall - 1
+                            delegate: ChoiceChip {
+                                required property var modelData
+                                label: modelData.label
+                                active: root.side === modelData.value
+                                onPicked: root.run("uscreen config set position " + modelData.value)
                             }
                         }
+                    }
+                }
 
-                        MouseArea {
-                            anchors.fill: parent
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.run("uscreen config mode " + presetRect.modelData.spec)
+                Column {
+                    width: parent.width
+                    spacing: Theme.spacingS
+
+                    StyledText {
+                        text: "Scale"
+                        color: Theme.surfaceVariantText
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Row {
+                        spacing: Theme.spacingS
+
+                        Repeater {
+                            model: root.scaleChoices
+
+                            delegate: ChoiceChip {
+                                required property string modelData
+                                label: modelData
+                                active: root.scaleValue === modelData
+                                onPicked: root.run("uscreen config set scale " + modelData)
+                            }
+                        }
+                    }
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: Theme.spacingS
+
+                    StyledText {
+                        text: "Mode"
+                        color: Theme.surfaceVariantText
+                        font.pixelSize: Theme.fontSizeSmall
+                    }
+
+                    Row {
+                        spacing: Theme.spacingS
+
+                        Repeater {
+                            model: root.presets
+
+                            delegate: ChoiceChip {
+                                required property var modelData
+                                label: modelData.label
+                                active: root.modeSpec === modelData.spec
+                                onPicked: root.run("uscreen config mode " + modelData.spec)
+                            }
                         }
                     }
                 }
