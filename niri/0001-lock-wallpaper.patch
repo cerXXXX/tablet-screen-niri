@@ -1,0 +1,89 @@
+From 106797474c8c07e55056b60965a75f6f842587bf Mon Sep 17 00:00:00 2001
+From: cerXXXX <84661580+cerXXXX@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:42:13 +0300
+Subject: [PATCH] Show the wallpapers under a see-through lock surface
+
+While locked, niri drew only the lock surface over a solid color, so a live wallpaper
+(Wallpaper Engine, an animated or video wallpaper) couldn't show on the lock screen without the
+locker rendering it a second time. Now the background layer is drawn under the lock surface, the
+same way as on the desktop: the wallpaper keeps running (it gets its frame callbacks) and shows
+the moment the session locks. An opaque lock surface still covers it, and without a lock surface
+(the locker died) only the solid color is drawn. Windows and the other layers stay hidden.
+
+The lock surface can also have the wallpaper blurred through ext-background-effect now.
+
+The version string says "lock-wallpaper" so lockers can tell.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/niri.rs      | 35 +++++++++++++++++++++++++++++++++++
+ src/utils/mod.rs |  5 +++--
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/src/niri.rs b/src/niri.rs
+index ec40e01c..82385b9f 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -4241,6 +4241,41 @@ impl Niri {
+                     Kind::ScanoutCandidate,
+                     &mut |elem| push(elem.into()),
+                 );
++
++                // A see-through lock surface shows the wallpapers (the background layer, nothing
++                // else) under it, still running, and can have them blurred through
++                // ext-background-effect. An opaque one covers them. Without a lock surface (the
++                // locker died) only the solid color below is drawn.
++                let output_geo = Rectangle::from_size(output_size(output));
++                crate::render_helpers::background_effect::render_for_tile(
++                    ctx.as_gles(),
++                    None,
++                    output_geo,
++                    output_scale.x,
++                    false,
++                    surface.wl_surface(),
++                    Point::new(0., 0.),
++                    Scale::from(1.),
++                    self.config.borrow().blur,
++                    niri_config::CornerRadius::default(),
++                    niri_config::BackgroundEffect::default(),
++                    false,
++                    XrayPos::default(),
++                    &mut |elem| push(LayerSurfaceRenderElement::from(elem).into()),
++                );
++
++                let layer_map = layer_map_for_output(output);
++                for for_backdrop in [false, true] {
++                    self.render_layer_normal(
++                        ctx.r(),
++                        None,
++                        &layer_map,
++                        Layer::Background,
++                        XrayPos::default(),
++                        for_backdrop,
++                        &mut |elem| push(elem.into()),
++                    );
++                }
+             }
+ 
+             // Draw the solid color background.
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index bbeac5bc..7d33bdde 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -152,10 +152,11 @@ pub fn version() -> String {
+     let commit =
+         option_env!("NIRI_BUILD_COMMIT").unwrap_or(git_version!(fallback = "unknown commit"));
+ 
++    // lock-wallpaper: the wallpapers show under a see-through lock surface (clients check for it)
+     if PATCH == "0" {
+-        format!("{MAJOR}.{MINOR:0>2} ({commit})")
++        format!("{MAJOR}.{MINOR:0>2} ({commit}, lock-wallpaper)")
+     } else {
+-        format!("{MAJOR}.{MINOR:0>2}.{PATCH} ({commit})")
++        format!("{MAJOR}.{MINOR:0>2}.{PATCH} ({commit}, lock-wallpaper)")
+     }
+ }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,31 @@
+[package]
+name = "capture"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+# used by session.rs for renegotiation logging
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+rustix = { version = "1", features = ["fs", "mm", "time"] }
+memmap2 = "0.9"
+png = "0.18"
+gbm = "0.18"
+drm-fourcc = "2.2"
+wayland-scanner = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", optional = true }
+
+[features]
+# KDE Plasma capture backend. Off by default: it needs the
+# plasma-wayland-protocols XML at build time, and a Hyprland build must not
+# acquire a KDE dependency it never uses.
+plasma = ["dep:wayland-scanner", "dep:wayland-backend"]
+
+[[bin]]
+name = "plasma-probe"
+path = "src/bin/plasma_probe.rs"
+required-features = ["plasma"]

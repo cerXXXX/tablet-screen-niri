@@ -1,0 +1,109 @@
+# niri with both patches this machine needs, in one package with a name that
+# says so:
+#
+#   0001 lock wallpaper   — the live wallpaper shows under a see-through lock
+#                           surface (clients and lockers check for the tag)
+#   0002 virtual outputs  — upstream PR #3800: `niri msg create-virtual-output`,
+#                           `create-virtual` in config.kdl, capture via
+#                           ext-image-copy-capture / wlr-screencopy
+#   0003 version string   — `niri --version` names both, so a bug report says
+#                           which build it came from
+#
+# Built from main rather than the v26.04 tarball: PR #3800 is against main and
+# does not apply to 26.04 (and `ext-image-copy-capture`, which the tablet
+# stream needs, only exists in main since 2026-09-12).
+#
+# Bumping: set _commit to a newer main commit, `updpkgsums`, and raise pkgrel.
+# The patches are the only local changes; everything else is upstream.
+#
+# Name and `replaces`: this package supersedes niri-lock-wallpaper (same lock
+# wallpaper patch, plus virtual outputs). It also *provides* that name, so a
+# `pacman -S niri-lock-wallpaper` resolves to this one instead of silently
+# downgrading to a build without virtual outputs.
+
+pkgname=niri-lock-wallpaper-tablet
+_pkgname=niri
+pkgver=26.4.0
+pkgrel=2
+_commit=a8562a1126922ed4c1c94d34c1dbb26633491d05
+pkgdesc="Scrollable-tiling Wayland compositor (wallpaper under the lock screen + virtual outputs for the tablet)"
+arch=(x86_64)
+url="https://github.com/niri-wm/niri"
+license=(GPL-3.0-or-later)
+depends=(
+  cairo
+  glib2
+  glibc
+  libdisplay-info
+  libgcc
+  libinput
+  libpipewire
+  libxkbcommon
+  mesa
+  pango
+  pixman
+  seatd
+  systemd-libs
+  xdg-desktop-portal-impl
+)
+makedepends=(
+  clang
+  git
+  rust
+)
+optdepends=(
+  'bash: for niri-session script'
+  'xwayland-satellite: for running X11 apps in XWayland'
+  'xdg-desktop-portal-gnome: a XDG desktop portal required for screencasting'
+)
+provides=("$_pkgname=$pkgver" "niri-lock-wallpaper=$pkgver" wayland-compositor)
+conflicts=("$_pkgname" niri-lock-wallpaper)
+# Anything that was niri before: the stock package, the lock-wallpaper-only
+# build, and the throwaway niri-tablet this repository produced while the
+# package was being named. Without these in `replaces` pacman asks whether to
+# remove them and `--noconfirm` answers "no", which is how the first install
+# attempt failed.
+replaces=(niri niri-lock-wallpaper niri-tablet)
+
+source=("${_pkgname}::git+https://github.com/niri-wm/niri.git#commit=${_commit}"
+        "0001-lock-wallpaper.patch"
+        "0002-virtual-outputs.patch"
+        "0003-version-string.patch")
+sha256sums=('e5152bd45302e7f8e6b5fd0c1ad0664faa4b03685b1f6cc0155ad3713d3fb0c9'
+            'a42382b8b3e012a4ec425bf622f3b86b45e31f39e998f9975f3fe82c8cdcaf47'
+            '4fb1c790652f8e54b1f7ad3670672fdb5ea93fa826f5f4adeeae3fca85a2443f'
+            'd6ff5adee2644ecca0be319c5ce19a7f93a5097ab0d0495e134093d29ba71bee')
+
+prepare() {
+  cd $_pkgname
+  patch -Np1 -i ../0001-lock-wallpaper.patch
+  patch -Np1 -i ../0002-virtual-outputs.patch
+  patch -Np1 -i ../0003-version-string.patch
+  cargo fetch --locked --target "$(rustc --print host-tuple)"
+}
+
+build() {
+  cd $_pkgname
+  export NIRI_BUILD_COMMIT="${_commit:0:7}"
+  CFLAGS+=(' -ffat-lto-objects')
+  cargo build --frozen --release --features default
+
+  # generate shell completions
+  for shell in bash fish zsh; do
+    cargo run --frozen --release --bin niri -- \
+      completions "$shell" > "$shell-completions"
+  done
+}
+
+package() {
+  cd $_pkgname
+  install -vDm 755 {target/release/$_pkgname,resources/$_pkgname-session} -t "$pkgdir/usr/bin/"
+  install -vDm 644 resources/$_pkgname{.service,-shutdown.target} -t "$pkgdir/usr/lib/systemd/user/"
+  install -vDm 644 resources/$_pkgname.desktop -t "$pkgdir/usr/share/wayland-sessions/"
+  install -vDm 644 resources/$_pkgname-portals.conf -t "$pkgdir/usr/share/xdg-desktop-portal/"
+  install -vDm 644 resources/default-config.kdl README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  # shell auto-completions
+  install -vDm 644 bash-completions "$pkgdir/usr/share/bash-completion/completions/niri"
+  install -vDm 644 fish-completions "$pkgdir/usr/share/fish/vendor_completions.d/niri.fish"
+  install -vDm 644 zsh-completions "$pkgdir/usr/share/zsh/site-functions/_niri"
+}

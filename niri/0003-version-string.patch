@@ -1,0 +1,20 @@
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index 1e2ec83..494d254 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -153,11 +153,12 @@ pub fn version() -> String {
+     let commit =
+         option_env!("NIRI_BUILD_COMMIT").unwrap_or(git_version!(fallback = "unknown commit"));
+ 
+-    // lock-wallpaper: the wallpapers show under a see-through lock surface (clients check for it)
++    // lock-wallpaper+virtual-output: wallpapers under a see-through lock surface,
++    // and `niri msg create-virtual-output` for the tablet's second screen.
+     if PATCH == "0" {
+-        format!("{MAJOR}.{MINOR:0>2} ({commit}, lock-wallpaper)")
++        format!("{MAJOR}.{MINOR:0>2} ({commit}, lock-wallpaper+virtual-output)")
+     } else {
+-        format!("{MAJOR}.{MINOR:0>2}.{PATCH} ({commit}, lock-wallpaper)")
++        format!("{MAJOR}.{MINOR:0>2}.{PATCH} ({commit}, lock-wallpaper+virtual-output)")
+     }
+ }
+ 

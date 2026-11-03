@@ -1,0 +1,1004 @@
+//! `uscreen doctor` — one-shot check of everything that has to be true for the
+//! pipeline to work, with an actionable hint for every failure.
+//!
+//! This is deliberately the first thing to run whenever the stream "is laggy
+//! again". The most common cause is not the pipeline at all but orphaned
+//! `evdi_helper`/`ffmpeg` processes from a previous run: several writers on the
+//! shared capture FIFO interleave at pipe granularity, and no amount of
+//! restarting the daemon fixes it until they are killed.
+
+use crate::capture::fifo_path;
+use crate::config::{self, FileConfig, MAX_BITRATE_KBPS, MAX_FPS};
+use crate::vdisplay;
+use anyhow::Result;
+use std::path::Path;
+
+#[derive(PartialEq)]
+enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+struct Report {
+    warnings: u32,
+    failures: u32,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self {
+            warnings: 0,
+            failures: 0,
+        }
+    }
+
+    fn line(&mut self, level: Level, label: &str, detail: &str) {
+        let mark = match level {
+            Level::Ok => "  ok  ",
+            Level::Warn => " warn ",
+            Level::Fail => " FAIL ",
+        };
+        match level {
+            Level::Warn => self.warnings += 1,
+            Level::Fail => self.failures += 1,
+            Level::Ok => {}
+        }
+        if detail.is_empty() {
+            println!("[{}] {}", mark, label);
+        } else {
+            println!("[{}] {:<34} {}", mark, label, detail);
+        }
+    }
+
+    /// A remedy printed under the finding it belongs to.
+    fn hint(&self, text: &str) {
+        println!("         → {}", text);
+    }
+}
+
+fn section(title: &str) {
+    println!("\n{}", title);
+    println!("{}", "-".repeat(title.len()));
+}
+
+async fn output_of(program: &str, args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn command_exists(name: &str) -> bool {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|dir| Path::new(dir).join(name).exists())
+}
+
+/// PIDs whose executable name matches exactly (`pgrep -x`).
+async fn pids_exact(name: &str) -> Vec<u32> {
+    parse_pids(output_of("pgrep", &["-x", name]).await)
+}
+
+/// PIDs whose full command line matches a pattern (`pgrep -f`).
+async fn pids_full(pattern: &str) -> Vec<u32> {
+    parse_pids(output_of("pgrep", &["-f", pattern]).await)
+}
+
+fn parse_pids(out: Option<String>) -> Vec<u32> {
+    out.unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn check_modules(r: &mut Report) {
+    match std::fs::read_to_string("/sys/devices/evdi/count") {
+        Ok(text) => {
+            let count: i32 = text.trim().parse().unwrap_or(-1);
+            if count > 0 {
+                r.line(Level::Ok, "evdi module", &format!("{} device(s)", count));
+            } else {
+                r.line(Level::Fail, "evdi module", "loaded, but no device created");
+                r.hint("for this boot:   echo 1 | sudo tee /sys/devices/evdi/add");
+                // The one-shot write above does not survive a reboot, and
+                // initial_device_count is only read when the module loads —
+                // so writing the modprobe.d file is not enough on a machine
+                // where evdi is already resident. Both halves matter.
+                r.hint(
+                    "for every boot: echo 'options evdi initial_device_count=2' | sudo tee \
+                     /etc/modprobe.d/uscreen-evdi.conf && sudo modprobe -r evdi && sudo modprobe evdi",
+                );
+            }
+        }
+        Err(_) => {
+            r.line(Level::Fail, "evdi module", "not loaded");
+            r.hint("install evdi-dkms (on Arch it is in the AUR: yay -S evdi-dkms), then: sudo modprobe evdi");
+            r.hint("sudo modprobe evdi   (install evdi-dkms if that fails)");
+        }
+    }
+
+    let uinput = Path::new("/dev/uinput");
+    if !uinput.exists() {
+        r.line(Level::Fail, "uinput device", "/dev/uinput missing");
+        r.hint("sudo modprobe uinput");
+    } else {
+        // Existence is not enough — the daemon runs unprivileged and needs to
+        // open it for writing, which is what actually fails in practice.
+        match std::fs::OpenOptions::new().write(true).open(uinput) {
+            Ok(_) => r.line(Level::Ok, "uinput device", "writable"),
+            Err(e) => {
+                r.line(Level::Fail, "uinput device", &format!("not writable: {}", e));
+                r.hint("sudo install -Dm644 packaging/60-uscreen-uinput.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput");
+            }
+        }
+    }
+}
+
+async fn check_tools(r: &mut Report, cfg: &FileConfig) {
+    for (tool, fatal) in [("ffmpeg", true), ("adb", true), ("kscreen-doctor", false)] {
+        if command_exists(tool) {
+            r.line(Level::Ok, tool, "found");
+        } else if fatal {
+            r.line(Level::Fail, tool, "not installed");
+            r.hint(&format!("install {} with your package manager", tool));
+        } else {
+            if crate::hyprland::active() {
+                r.line(Level::Ok, tool, "not needed on Hyprland (hyprctl is used)");
+            } else if crate::niri::active() {
+                r.line(Level::Ok, tool, "not needed on niri (`niri msg` is used)");
+            } else if crate::gnome::active() || crate::x11::active() || crate::cosmic::active() {
+                r.line(Level::Ok, tool, "not needed on this desktop");
+            } else {
+                r.line(Level::Warn, tool, "not installed (KDE only)");
+            }
+        }
+    }
+
+    // By actually encoding a frame: `ffmpeg -encoders` lists what ffmpeg was
+    // built with, and a distribution build is built with everything. An AMD
+    // laptop had h264_nvenc "available" by that measure (#15).
+    if output_of("ffmpeg", &["-version"]).await.is_some() {
+        if let Err(why) = crate::encoders::probe(&cfg.encoder).await {
+            r.line(
+                Level::Fail,
+                "configured encoder",
+                &format!("{} cannot encode on this machine", cfg.encoder),
+            );
+            r.hint(&format!("ffmpeg: {}", why));
+            let mut alternatives = Vec::new();
+            for e in crate::encoders::CANDIDATES {
+                if e != cfg.encoder && crate::encoders::works(e).await {
+                    alternatives.push(e);
+                }
+            }
+            if alternatives.is_empty() {
+                r.hint("no H.264 encoder works at all — on Fedora, install ffmpeg from RPM Fusion");
+            } else {
+                r.hint(&format!(
+                    "works here: {} — the daemon switches to the first of these by itself on start",
+                    alternatives.join(", ")
+                ));
+            }
+        } else {
+            r.line(
+                Level::Ok,
+                "configured encoder",
+                &format!("{} encodes a test frame", cfg.encoder),
+            );
+            if cfg.encoder.contains("vaapi") {
+                r.line(Level::Ok, "VAAPI device", &crate::encoders::vaapi_device());
+            }
+        }
+    }
+}
+
+/// The check that matters most: more than one helper or encoder means several
+/// processes are writing/reading the same FIFO and every frame is corrupt.
+async fn check_processes(r: &mut Report) {
+    let daemons = pids_exact("uscreen").await;
+    let helpers = pids_exact("evdi_helper").await;
+    let encoders = pids_full(&format!("ffmpeg.*{}", fifo_path())).await;
+
+    // The PID file is the daemon's single slot; anything running beside it is
+    // untracked and `uscreen stop` will never reach it.
+    let pid_file = crate::get_pid_path();
+    let tracked: Option<u32> = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .filter(|pid| Path::new(&format!("/proc/{}", pid)).exists());
+
+    match tracked {
+        Some(pid) => r.line(Level::Ok, "daemon", &format!("running, PID {}", pid)),
+        None if pid_file.exists() => {
+            r.line(Level::Warn, "daemon", "stale PID file, not running");
+            r.hint(&format!("rm {}", pid_file.display()));
+        }
+        None => r.line(Level::Ok, "daemon", "not running"),
+    }
+
+    // `pgrep -x uscreen` also matches this very process — excluding it is not
+    // cosmetic: reporting ourselves as an orphan would send the user off to
+    // `pkill -x uscreen` chasing a process that never existed.
+    let self_pid = std::process::id();
+    let untracked: Vec<u32> = daemons
+        .iter()
+        .copied()
+        .filter(|p| *p != self_pid && Some(*p) != tracked)
+        .collect();
+    if !untracked.is_empty() {
+        r.line(
+            Level::Fail,
+            "orphaned uscreen daemons",
+            &format!("{:?}", untracked),
+        );
+        r.hint("these fight over the same FIFO and ports — kill them: pkill -x uscreen");
+    }
+
+    // Several helpers are fine with several tablets — each writes its own
+    // FIFO. Two on the same FIFO are the fault.
+    let mut per_fifo: std::collections::HashMap<String, Vec<u32>> = Default::default();
+    for pid in &helpers {
+        let args: Vec<String> = std::fs::read(format!("/proc/{}/cmdline", pid))
+            .map(|b| {
+                b.split(|c| *c == 0)
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fifo = args
+            .iter()
+            .position(|a| a == "--capture-fifo")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+        per_fifo.entry(fifo).or_default().push(*pid);
+    }
+    if let Some((fifo, pids)) = per_fifo.iter().find(|(_, p)| p.len() > 1) {
+        r.line(
+            Level::Fail,
+            "evdi_helper processes",
+            &format!("{} writing {}: {:?}", pids.len(), fifo, pids),
+        );
+        r.hint("several writers interleave on the FIFO — torn frames: pkill -x evdi_helper");
+    } else if helpers.len() == 1 && tracked.is_none() {
+        r.line(Level::Fail, "evdi_helper", "orphaned (no daemon owns it)");
+        r.hint("pkill -x evdi_helper");
+    } else {
+        r.line(
+            Level::Ok,
+            "evdi_helper processes",
+            &format!("{}", helpers.len()),
+        );
+    }
+
+    if encoders.len() > 1 {
+        r.line(
+            Level::Fail,
+            "ffmpeg on capture FIFO",
+            &format!("{} running: {:?}", encoders.len(), encoders),
+        );
+        r.hint("two readers on one pipe corrupt frames — kill the strays");
+    } else if encoders.len() == 1 && tracked.is_none() {
+        r.line(Level::Fail, "ffmpeg on capture FIFO", "orphaned");
+        r.hint(&format!("pkill -f 'ffmpeg.*{}'", &fifo_path()));
+    } else {
+        r.line(
+            Level::Ok,
+            "ffmpeg on capture FIFO",
+            &format!("{}", encoders.len()),
+        );
+    }
+}
+
+async fn check_tablet(r: &mut Report, cfg: &FileConfig) {
+    // `adb get-state` errors out when more than one device is attached, so
+    // enumerate instead — that failure mode is silent otherwise.
+    let Some(list) = output_of("adb", &["devices"]).await else {
+        r.line(Level::Warn, "adb", "could not run");
+        return;
+    };
+    let devices: Vec<&str> = list
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            let serial = parts.next()?;
+            let state = parts.next()?;
+            (state == "device").then_some(serial)
+        })
+        .collect();
+
+    // Which device every later check should address. With more than one
+    // present, a bare `adb shell` fails outright ("more than one
+    // device/emulator") — which is how this check used to report a perfectly
+    // well installed app as missing the moment `adb tcpip` was in use.
+    let chosen: Option<&str> = devices
+        .iter()
+        .find(|d| !crate::is_network_serial(d))
+        .or_else(|| devices.first())
+        .copied();
+
+    match devices.len() {
+        0 => {
+            let unauthorized = list.contains("unauthorized");
+            if unauthorized {
+                r.line(Level::Fail, "tablet", "attached but unauthorized");
+                r.hint("accept the 'Allow USB debugging' prompt on the tablet");
+            } else {
+                r.line(Level::Warn, "tablet", "not connected");
+                r.hint("plug in the USB cable and enable USB debugging");
+            }
+            return;
+        }
+        1 => {
+            r.line(Level::Ok, "tablet", devices[0]);
+            report_transport(r, devices[0]);
+        }
+        n => {
+            let pick = chosen.unwrap_or(devices[0]);
+            // Two entries can mean one tablet reachable two ways — `adb tcpip`
+            // leaves the cable working alongside the network device — or two
+            // different Android devices plugged in, which is a different
+            // situation entirely: the daemon drives the first and the app is
+            // launched there, so watching the other one shows a black screen.
+            // Only the second kind has more than one USB serial.
+            let usb: Vec<&&str> = devices.iter().filter(|d| !crate::is_network_serial(d)).collect();
+            if usb.len() > 1 {
+                let mut named = Vec::new();
+                for d in &devices {
+                    match output_of("adb", &["-s", d, "shell", "getprop", "ro.product.model"]).await {
+                        Some(m) if !m.trim().is_empty() => named.push(format!("{} ({})", d, m.trim())),
+                        _ => named.push(d.to_string()),
+                    }
+                }
+                r.line(
+                    Level::Warn,
+                    "tablet",
+                    &format!("{} Android devices attached — using {}", n, pick),
+                );
+                r.hint(&format!(
+                    "attached: {}. The daemon drives the first one and launches the app there, \
+                     so a second device shows nothing. Unplug the others, or raise max_tablets \
+                     to give each its own screen.",
+                    named.join(", ")
+                ));
+            } else {
+                r.line(
+                    Level::Ok,
+                    "tablet",
+                    &format!("{} reachable {} ways: {:?}", pick, n, devices),
+                );
+            }
+            report_transport(r, pick);
+        }
+    }
+    let dev_args: Vec<String> = match chosen {
+        Some(d) => vec!["-s".into(), d.to_string()],
+        None => Vec::new(),
+    };
+
+    let mut reverse_args: Vec<&str> = dev_args.iter().map(|s| s.as_str()).collect();
+    reverse_args.extend_from_slice(&["reverse", "--list"]);
+    match output_of("adb", &reverse_args).await {
+        Some(reverse) => {
+            for port in [cfg.video_port, cfg.input_port] {
+                let needle = format!("tcp:{}", port);
+                if reverse.contains(&needle) {
+                    r.line(Level::Ok, &format!("adb reverse {}", port), "forwarded");
+                } else {
+                    r.line(
+                        Level::Warn,
+                        &format!("adb reverse {}", port),
+                        "not forwarded",
+                    );
+                    r.hint(&format!("adb reverse tcp:{p} tcp:{p}", p = port));
+                }
+            }
+        }
+        None => r.line(Level::Warn, "adb reverse", "could not query"),
+    }
+
+    // Whether this tablet can decode HEVC, and in 10 bits. Measured on one
+    // Tab S9 Ultra, HEVC was slightly faster than H.264 and Main10 cost
+    // nothing on top — but only where the hardware decoder exists, which is
+    // exactly what this asks. H.264 stays the default because it is the one
+    // every device has.
+    let mut codec_args: Vec<&str> = dev_args.iter().map(|s| s.as_str()).collect();
+    codec_args.extend_from_slice(&["shell", "dumpsys", "media.player"]);
+    if let Some(out) = output_of("adb", &codec_args).await {
+        let hevc = out.contains("video/hevc");
+        let main10 = out.contains("Main10");
+        match (hevc, main10, cfg.encoder.contains("hevc")) {
+            (_, _, true) => r.line(Level::Ok, "tablet codec", "HEVC, and the host is sending it"),
+            (true, true, false) => {
+                r.line(Level::Ok, "tablet codec", "HEVC Main10 supported in hardware");
+                r.hint(
+                    "optional: switch the encoder to hevc_nvenc for sharper text at the same \
+                     bitrate, and tick 10-bit to smooth gradients",
+                );
+            }
+            (true, false, false) => {
+                r.line(Level::Ok, "tablet codec", "HEVC supported (8-bit)");
+                r.hint("optional: switch the encoder to hevc_nvenc for sharper text");
+            }
+            (false, _, false) => r.line(
+                Level::Ok,
+                "tablet codec",
+                "H.264 only — leave the encoder as it is",
+            ),
+        }
+    }
+
+    let mut pm_args: Vec<&str> = dev_args.iter().map(|s| s.as_str()).collect();
+    pm_args.extend_from_slice(&["shell", "pm", "list", "packages", "com.uscreen"]);
+    if let Some(out) = output_of("adb", &pm_args).await {
+        if out.contains("com.uscreen") {
+            r.line(Level::Ok, "tablet app", "installed");
+        } else {
+            r.line(Level::Fail, "tablet app", "com.uscreen not installed");
+            r.hint("adb install android/app/build/outputs/apk/debug/app-debug.apk");
+        }
+    }
+}
+
+async fn check_virtual_display(r: &mut Report, cfg: &FileConfig) {
+    let connectors = vdisplay::evdi_connectors();
+    if connectors.is_empty() {
+        r.line(Level::Fail, "EVDI connector", "none found in sysfs");
+        r.hint("the evdi module is loaded but exposes no DRM connector — reboot or re-add");
+        return;
+    }
+    for c in &connectors {
+        r.line(
+            if c.connected { Level::Ok } else { Level::Warn },
+            "EVDI connector",
+            &format!(
+                "{} ({})",
+                c.name,
+                if c.connected {
+                    "connected"
+                } else {
+                    "disconnected — helper not running"
+                }
+            ),
+        );
+    }
+
+    let names: Vec<&str> = connectors.iter().map(|c| c.name.as_str()).collect();
+    if crate::niri::active() {
+        let Some(monitors) = crate::niri::monitors().await else {
+            r.line(Level::Warn, "niri", "`niri msg outputs` did not answer");
+            return;
+        };
+        for m in monitors.iter().filter(|m| names.contains(&m.name.as_str())) {
+            if m.is_on() {
+                r.line(
+                    Level::Ok,
+                    "niri output",
+                    &format!(
+                        "{} at {:.0}x{:.0} logical (mode {}x{}), scale {}",
+                        m.name,
+                        m.width,
+                        m.height,
+                        m.best_mode.map(|b| b.0).unwrap_or(0),
+                        m.best_mode.map(|b| b.1).unwrap_or(0),
+                        m.scale
+                    ),
+                );
+            } else {
+                r.line(Level::Warn, "niri output", &format!("{} is off", m.name));
+                r.hint(
+                    "the daemon switches it on while a tablet is a screen; nothing is rendered \
+                     while it is off",
+                );
+            }
+        }
+        return;
+    }
+    if crate::hyprland::active() {
+        let Some(monitors) = crate::hyprland::monitors().await else {
+            r.line(Level::Warn, "Hyprland", "hyprctl did not answer");
+            return;
+        };
+        for m in monitors.iter().filter(|m| names.contains(&m.name.as_str())) {
+            if m.is_on() {
+                r.line(
+                    Level::Ok,
+                    "Hyprland output",
+                    &format!("{} at {}x{}, scale {}", m.name, m.width, m.height, m.scale),
+                );
+            } else {
+                r.line(Level::Warn, "Hyprland output", &format!("{} is off (0x0)", m.name));
+                r.hint("the daemon switches it on while a tablet is a screen; nothing is rendered while it is off");
+            }
+        }
+        return;
+    }
+    let Some(json) = output_of("kscreen-doctor", &["-j"]).await else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        r.line(Level::Warn, "kscreen-doctor", "unparseable JSON output");
+        return;
+    };
+    let Some(outputs) = value.get("outputs").and_then(|o| o.as_array()) else {
+        return;
+    };
+
+    for out in outputs {
+        let name = out.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if !names.contains(&name) {
+            continue;
+        }
+        let enabled = out
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !enabled {
+            r.line(Level::Warn, "KDE output", &format!("{} is disabled", name));
+            r.hint("the daemon enables it on start; nothing is rendered while it is off");
+            continue;
+        }
+        let w = out.pointer("/size/width").and_then(|v| v.as_i64()).unwrap_or(0);
+        let h = out
+            .pointer("/size/height")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // A mismatch here is the classic "skewed / torn picture": ffmpeg is
+        // told one frame size while the helper produces another.
+        if w as u32 == cfg.width && h as u32 == cfg.height {
+            r.line(
+                Level::Ok,
+                "KDE output mode",
+                &format!("{} at {}x{}", name, w, h),
+            );
+        } else {
+            r.line(
+                Level::Fail,
+                "KDE output mode",
+                &format!("{} is {}x{}, config says {}x{}", name, w, h, cfg.width, cfg.height),
+            );
+            r.hint("the encoder frame size will not match the capture — picture will be skewed");
+        }
+    }
+}
+
+/// `kwin 6.8.2` (the output of `kwin_wayland --version`) as (6, 8, 2).
+fn kwin_version(text: &str) -> Option<(u32, u32, u32)> {
+    let v = text.split_whitespace().last()?;
+    let mut parts = v.split('.').map(|p| p.parse::<u32>().ok());
+    Some((parts.next()??, parts.next()??, parts.next().flatten().unwrap_or(0)))
+}
+
+/// The on-screen keyboard pops up whenever a touchscreen is used, and the
+/// tablet's touch device is exactly that as far as the desktop is concerned.
+/// Reported because it is a global desktop setting, not something the daemon
+/// should quietly decide on the user's behalf.
+async fn check_osk(r: &mut Report) {
+    // niri maps an absolute device onto the whole desktop and has no
+    // per-device output setting, so the injector scales coordinates instead.
+    if crate::niri::active() {
+        r.line(
+            Level::Ok,
+            "niri",
+            "touch and pen coordinates are scaled into the tablet's output",
+        );
+        return;
+    }
+    // Hyprland has no KWin to ask; hyprctl does the mapping there.
+    if crate::hyprland::active() {
+        r.line(Level::Ok, "Hyprland", "hyprctl maps touch and pen onto the tablet's output");
+        return;
+    }
+    if crate::gnome::active() {
+        r.line(Level::Ok, "GNOME", "pen and touch are mapped through GNOME's per-device settings");
+        return;
+    }
+    if crate::x11::active() {
+        r.line(Level::Ok, "X11", "pen and touch are mapped with xinput map-to-output");
+        return;
+    }
+    // KWin is only there on Plasma. On COSMIC or GNOME its absence is not a
+    // fault, and a FAIL sent people hunting for a qdbus package (#26).
+    let session = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if !session.is_empty() && !session.to_uppercase().contains("KDE") {
+        r.line(
+            Level::Warn,
+            "desktop",
+            &format!("{} — pen and touch mapping is manual here", session),
+        );
+        if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t == "x11") && !command_exists("xinput") {
+            r.hint("install the `xinput` package and UScreen maps the pen and touch itself on X11");
+        } else {
+            r.hint(
+                "UScreen maps the tablet's input onto its screen automatically on KDE Plasma, \
+                 Hyprland, GNOME (Wayland) and X11 sessions. Elsewhere, assign the \"UScreen \
+                 Pen\" and \"UScreen Touch\" devices to the UScreen output in your desktop's \
+                 settings.",
+            );
+        }
+        return;
+    }
+    // Whether we can reach KWin at all decides whether touch and pen land on
+    // the tablet's screen, so it is reported first and in its own right.
+    match crate::kwin::backend().await {
+        Some(b) => r.line(Level::Ok, "KWin D-Bus", &format!("reachable via {}", b.name())),
+        None => {
+            r.line(
+                Level::Fail,
+                "KWin D-Bus",
+                "unreachable — touch and pen will drive the wrong screen",
+            );
+            r.hint(
+                "the daemon maps the tablet's input onto the virtual display over KWin's \
+                 D-Bus interface, using busctl (systemd) or qdbus. Install systemd's busctl, \
+                 or a qdbus package (qdbus-qt6 on Debian/Ubuntu, qt6-tools elsewhere).",
+            );
+            return;
+        }
+    }
+
+    // KWin 6.8.2 crashes the whole desktop when a virtual (EVDI) screen is
+    // shown, which is what UScreen's screen is to it (KDE bug 527984).
+    if let Some(text) = output_of("kwin_wayland", &["--version"]).await {
+        match kwin_version(&text) {
+            Some((6, 8, 2)) => {
+                r.line(
+                    Level::Warn,
+                    "KWin version",
+                    "6.8.2 — crashes with virtual displays (KDE bug 527984)",
+                );
+                r.hint(
+                    "if the desktop crashes when the tablet connects: the fix is on the Plasma 6.8 \
+                     branch (29 Oct 2026) but not in every build yet — update KWin when your \
+                     distribution has it, or go back to 6.8.1",
+                );
+            }
+            Some((a, b, c)) => r.line(Level::Ok, "KWin version", &format!("{}.{}.{}", a, b, c)),
+            None => {}
+        }
+    }
+
+    // The live value, not the one in kwinrc: KWin does not re-read that file,
+    // so the two disagree routinely and only this one reflects what happens.
+    let Some(raw) =
+        crate::kwin::get_property("/VirtualKeyboard", "org.kde.kwin.VirtualKeyboard", "mode").await
+    else {
+        return;
+    };
+    let mode: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    match mode.trim() {
+        "1" | "2" => {
+            r.line(
+                Level::Warn,
+                "on-screen keyboard",
+                "pops up on touch input",
+            );
+            r.hint("the daemon turns this off while it runs and puts it back on exit");
+        }
+        "0" => r.line(Level::Ok, "on-screen keyboard", "only when asked for"),
+        _ => {}
+    }
+}
+
+/// Whether plugging the cable in is actually enough on its own.
+async fn check_autostart(r: &mut Report) {
+    match output_of("systemctl", &["--user", "is-enabled", "uscreen.service"]).await {
+        Some(v) if v.trim() == "enabled" => {
+            r.line(Level::Ok, "start with the desktop", "enabled");
+        }
+        Some(_) => {
+            r.line(
+                Level::Warn,
+                "start with the desktop",
+                "disabled — the daemon must be started by hand",
+            );
+            r.hint("systemctl --user enable --now uscreen.service");
+        }
+        None => {}
+    }
+}
+
+/// Colour accuracy, for using the tablet to judge images rather than just to
+/// hold windows. Everything here is a setting rather than a bug, but each one
+/// silently ruins colour and none of them is visible from the host side.
+async fn check_colour(r: &mut Report) {
+    // Eye comfort / blue light filter warms the whole panel. Nothing on the
+    // host can compensate, and it is easy to leave on by accident.
+    match output_of("adb", &["shell", "settings", "get", "system", "blue_light_filter"]).await {
+        Some(v) if v.trim() == "1" => {
+            r.line(Level::Fail, "blue light filter", "ON — colours are warmed");
+            r.hint("tablet: Settings → Display → Eye comfort shield → off");
+        }
+        Some(v) if v.trim() == "0" => r.line(Level::Ok, "blue light filter", "off"),
+        _ => {}
+    }
+
+    // The same warming from other makers. Stock Android's Night Light is
+    // often on a schedule, which is how a picture can look right in the
+    // afternoon and orange after a reboot in the evening (#29); Xiaomi's
+    // Reading mode does the same.
+    for (namespace, key, name, hint) in [
+        (
+            "secure",
+            "night_display_activated",
+            "Night Light",
+            "tablet: Settings → Display → Night Light → off (or its schedule)",
+        ),
+        (
+            "system",
+            "screen_paper_mode_enabled",
+            "reading mode",
+            "tablet: Settings → Display → Reading mode → off",
+        ),
+    ] {
+        if let Some(v) = output_of("adb", &["shell", "settings", "get", namespace, key]).await {
+            if v.trim() == "1" {
+                r.line(Level::Fail, name, "ON — colours are warmed");
+                r.hint(hint);
+            }
+        }
+    }
+
+    // Samsung's "Vivid" screen mode stretches saturation past sRGB. "Natural"
+    // is the colour-accurate one.
+    if let Some(v) = output_of("adb", &["shell", "settings", "get", "system", "screen_mode_setting"]).await
+    {
+        let v = v.trim().to_string();
+        if v == "2" {
+            r.line(Level::Ok, "tablet screen mode", "Natural (sRGB)");
+        } else if !v.is_empty() && v != "null" {
+            r.line(
+                Level::Warn,
+                "tablet screen mode",
+                &format!("{} — not the sRGB-accurate mode", v),
+            );
+            r.hint("tablet: Settings → Display → Screen mode → Natural");
+        }
+    }
+
+    // Samsung's "Motion smoothness" setting. On "Standard" the panel only
+    // offers apps its 60 Hz modes, so the app's request for the fastest one
+    // gets 60 and every frame waits an average of 8 ms for vsync instead of
+    // 4. Seen on a Tab S9 Ultra: the app asked for the best mode and was
+    // handed 60 Hz until this was switched to Adaptive.
+    if let Some(v) = output_of("adb", &["shell", "settings", "get", "secure", "refresh_rate_mode"]).await
+    {
+        let v = v.trim().to_string();
+        if v == "0" {
+            r.line(
+                Level::Warn,
+                "tablet refresh rate",
+                "Motion smoothness is Standard — the panel is held at 60 Hz",
+            );
+            r.hint("tablet: Settings → Display → Motion smoothness → Adaptive (120 Hz)");
+        } else if !v.is_empty() && v != "null" {
+            r.line(Level::Ok, "tablet refresh rate", "Motion smoothness: adaptive");
+        }
+    }
+
+    // KWin can colour-manage the virtual output, but only once a profile is
+    // attached to it.
+    let names: Vec<String> = vdisplay::evdi_connectors()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    if let Some(json) = output_of("kscreen-doctor", &["-j"]).await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+            for out in v.get("outputs").and_then(|o| o.as_array()).unwrap_or(&vec![]) {
+                let name = out.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if !names.iter().any(|n| n == name) {
+                    continue;
+                }
+                let icc = out
+                    .get("iccProfilePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if icc.is_empty() {
+                    r.line(Level::Warn, "colour profile", "none assigned to the virtual display");
+                    r.hint(
+                        "System Settings → Display → pick the UScreen display → Color Profile. \
+                         A generic sRGB profile is the right baseline; a measured one needs a \
+                         colorimeter pointed at the tablet.",
+                    );
+                } else {
+                    r.line(Level::Ok, "colour profile", icc);
+                }
+            }
+        }
+    }
+}
+
+async fn check_version(r: &mut Report, cfg: &FileConfig) {
+    if !cfg.check_updates {
+        r.line(Level::Ok, "version", &format!("{} (update check disabled)", crate::update::current_version()));
+        return;
+    }
+    // One-shot: doctor is its own process and cannot read the daemon's daily
+    // result, and ten seconds on the network is fine for a diagnostic.
+    let cur = crate::update::current_version();
+    match crate::update::latest_release_tag().await {
+        Some(tag) => {
+            let latest = tag.trim_start_matches('v').to_string();
+            if crate::update::is_newer(&latest, cur) {
+                r.line(Level::Warn, "version", &format!("{} — {} is available", cur, latest));
+                r.hint(crate::update::RELEASES_PAGE);
+            } else {
+                r.line(Level::Ok, "version", &format!("{} (latest)", cur));
+            }
+        }
+        None => r.line(Level::Ok, "version", &format!("{} (could not check for updates)", cur)),
+    }
+}
+
+fn check_config(r: &mut Report, cfg: &FileConfig) {
+    let path = config::config_path();
+    // `cfg` has already been clamped, so compare against the raw file too: a
+    // stale 200 Mbps on disk is worth reporting even though the daemon would
+    // no longer act on it.
+    let on_disk: Option<FileConfig> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok());
+    r.line(Level::Ok, "config file", &format!("{}", path.display()));
+    if cfg.max_tablets > 1 {
+        let cards = crate::vdisplay::evdi_cards().len() as u32;
+        if cards >= cfg.max_tablets {
+            r.line(Level::Ok, "tablet slots", &format!("{} (EVDI devices: {})", cfg.max_tablets, cards));
+        } else {
+            r.line(
+                Level::Warn,
+                "tablet slots",
+                &format!("{} wanted, but only {} EVDI device(s) exist", cfg.max_tablets, cards),
+            );
+            r.hint(&format!(
+                "for this boot: echo 1 | sudo tee /sys/devices/evdi/add   (repeat {} time(s)); \
+                 for every boot: initial_device_count={} in /etc/modprobe.d/uscreen-evdi.conf",
+                cfg.max_tablets - cards, cfg.max_tablets
+            ));
+        }
+    }
+    r.line(
+        Level::Ok,
+        "screen position",
+        match cfg.position.as_str() {
+            "left" => "left of the other screens",
+            "above" => "above the other screens",
+            "below" => "below the other screens",
+            _ => "right of the other screens",
+        },
+    );
+    r.line(
+        Level::Ok,
+        "mode",
+        if cfg.pen_only {
+            "graphics tablet — no display is streamed (switchable from the tablet)"
+        } else {
+            "second screen (switchable from the tablet)"
+        },
+    );
+
+    let raw_bitrate = on_disk.as_ref().map(|c| c.bitrate).unwrap_or(cfg.bitrate);
+    if raw_bitrate > MAX_BITRATE_KBPS {
+        r.line(
+            Level::Warn,
+            "bitrate on disk",
+            &format!("{} Mbps — clamped to {} Mbps at runtime",
+                raw_bitrate / 1000,
+                cfg.bitrate / 1000),
+        );
+        r.hint("rewrite it via uscreen-gui (or the tablet settings) to make the file agree");
+    } else {
+        r.line(
+            Level::Ok,
+            "bitrate",
+            &format!("{} Mbps", cfg.bitrate as f64 / 1000.0),
+        );
+    }
+
+    let raw_fps = on_disk.as_ref().map(|c| c.fps).unwrap_or(cfg.fps);
+    if raw_fps > MAX_FPS {
+        r.line(
+            Level::Warn,
+            "fps on disk",
+            &format!("{} — clamped to {} at runtime", raw_fps, cfg.fps),
+        );
+        r.hint("the generated EDID is capped at 90 Hz, so anything above is duplicate frames");
+    } else {
+        r.line(Level::Ok, "fps", &format!("{}", cfg.fps));
+    }
+
+    r.line(
+        Level::Ok,
+        "resolution",
+        &format!(
+            "{}x{}{}",
+            cfg.width,
+            cfg.height,
+            if cfg.auto_resolution {
+                " (auto, follows the tablet)"
+            } else {
+                " (fixed)"
+            }
+        ),
+    );
+}
+
+pub async fn run() -> Result<()> {
+    println!("=== uscreen doctor ===");
+
+    let mut r = Report::new();
+    // Loaded once: every load logs a warning when it clamps a stale value, and
+    // repeating that between report sections buries the report itself.
+    let cfg = FileConfig::load();
+
+    section("Kernel modules");
+    check_modules(&mut r);
+
+    section("Tools");
+    check_tools(&mut r, &cfg).await;
+
+    section("Processes");
+    check_processes(&mut r).await;
+
+    section("Tablet");
+    check_tablet(&mut r, &cfg).await;
+
+    section("Virtual display");
+    check_virtual_display(&mut r, &cfg).await;
+
+    section("Autostart");
+    check_autostart(&mut r).await;
+
+    section("Desktop");
+    check_osk(&mut r).await;
+
+    section("Colour");
+    check_colour(&mut r).await;
+
+    section("Configuration");
+    check_version(&mut r, &cfg).await;
+    check_config(&mut r, &cfg);
+
+    println!();
+    if r.failures > 0 {
+        println!(
+            "{} problem(s) and {} warning(s) found — fix the FAIL lines first.",
+            r.failures, r.warnings
+        );
+    } else if r.warnings > 0 {
+        println!("No blocking problems, {} warning(s).", r.warnings);
+    } else {
+        println!("Everything checks out.");
+    }
+    Ok(())
+}
+
+/// A network serial is `host:port`; a USB serial never contains a colon.
+/// Worth reporting because the two transports differ by far more than the
+/// median suggests — the Wi-Fi tail is several times worse.
+fn report_transport(r: &mut Report, serial: &str) {
+    if crate::is_network_serial(serial) {
+        r.line(Level::Warn, "transport", "Wi-Fi — expect occasional stutter");
+        r.hint("plug the USB cable in for steady latency; the daemon prefers it automatically");
+    } else {
+        r.line(Level::Ok, "transport", "USB");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_kwin_version_from_its_banner() {
+        assert_eq!(kwin_version("kwin 6.8.2\n"), Some((6, 8, 2)));
+        assert_eq!(kwin_version("kwin 6.7.5"), Some((6, 7, 5)));
+        assert_eq!(kwin_version("kwin 6.8"), Some((6, 8, 0)));
+        assert_eq!(kwin_version(""), None);
+        assert_eq!(kwin_version("kwin"), None);
+    }
+}

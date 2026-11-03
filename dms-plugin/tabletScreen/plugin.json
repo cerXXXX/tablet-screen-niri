@@ -1,0 +1,13 @@
+{
+    "id": "tabletScreen",
+    "name": "Tablet Screen",
+    "description": "Turn the tablet's second screen on and off, and pick its resolution",
+    "version": "0.1.0",
+    "author": "local",
+    "type": "widget",
+    "capabilities": ["dankbar-widget"],
+    "component": "./TabletScreenWidget.qml",
+    "icon": "tablet_mac",
+    "settings": "./TabletScreenSettings.qml",
+    "permissions": ["settings_read", "settings_write"]
+}

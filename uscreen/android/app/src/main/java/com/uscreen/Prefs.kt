@@ -1,0 +1,89 @@
+package com.uscreen
+
+import android.content.Context
+import android.content.SharedPreferences
+
+/** Persisted user settings on the tablet side. */
+class Prefs(context: Context) {
+    private val sp: SharedPreferences =
+        context.getSharedPreferences("uscreen", Context.MODE_PRIVATE)
+
+    companion object {
+        /**
+         * Defaults deliberately match the host's own defaults. They used to be
+         * 200 Mbps / 90 fps, which the app pushed to the host on every start —
+         * overwriting whatever was configured on the desktop and driving the
+         * encoder far past what the USB link carries, so frames queued up and
+         * latency grew without bound.
+         */
+        const val DEFAULT_BITRATE_KBPS = 20_000
+        const val DEFAULT_FPS = 60
+
+        /** Kept in sync with `config::MAX_BITRATE_KBPS` on the host. */
+        const val MAX_BITRATE_KBPS = 60_000
+        const val MIN_BITRATE_KBPS = 5_000
+
+        /** Values of [orientation]. */
+        const val ORIENTATION_AUTO = 0
+        const val ORIENTATION_CAMERA_UP = 1
+        const val ORIENTATION_CAMERA_DOWN = 2
+    }
+
+    var bitrateKbps: Int
+        get() = sp.getInt("bitrate_kbps", DEFAULT_BITRATE_KBPS)
+            .coerceIn(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)
+        set(v) = sp.edit().putInt("bitrate_kbps", v).apply()
+
+    var fps: Int
+        get() = sp.getInt("fps", DEFAULT_FPS)
+        set(v) = sp.edit().putInt("fps", v).apply()
+
+    var showStats: Boolean
+        get() = sp.getBoolean("show_stats", false)
+        set(v) = sp.edit().putBoolean("show_stats", v).apply()
+
+    /**
+     * Whether fingers are sent to the computer at all. Off leaves only the pen,
+     * which is what people drawing with a resting hand want (SuperDisplay has
+     * the same switch). Applies at once and stays the tablet's own business.
+     */
+    /**
+     * In graphics-tablet mode nothing is streamed, and the screen would show
+     * the same explanation for as long as the pen is in use — hours of static
+     * text on an OLED panel. On, the explanation stays for a few seconds and
+     * the screen then goes fully black; pen and touch keep working.
+     */
+    var blankPenOnly: Boolean
+        get() = sp.getBoolean("blank_pen_only", true)
+        set(v) = sp.edit().putBoolean("blank_pen_only", v).apply()
+
+    var touchEnabled: Boolean
+        get() = sp.getBoolean("touch_enabled", true)
+        set(v) = sp.edit().putBoolean("touch_enabled", v).apply()
+
+    /**
+     * Which way round the tablet is held: [ORIENTATION_AUTO] follows the
+     * sensor between the two landscape directions, the other two pin it.
+     * Pinning exists because the sensor path does not work everywhere — a
+     * Galaxy Tab S9 Ultra with auto-rotate on never left "camera up" — and
+     * because people who draw with the camera at the bottom do not want the
+     * picture flipping when the tablet is lifted.
+     */
+    var orientation: Int
+        get() = sp.getInt("orientation", ORIENTATION_AUTO)
+        set(v) = sp.edit().putInt("orientation", v).apply()
+
+    /**
+     * The daemon's session token, delivered as an intent extra when it
+     * launches the app over adb. Kept so a relaunch by hand within the same
+     * daemon run still authenticates; a new daemon run hands out a new one.
+     */
+    var hostToken: String?
+        get() = sp.getString("host_token", null)
+        set(v) = sp.edit().putString("host_token", v).apply()
+
+    /** Shown once, after the first time video actually arrived. */
+    var thankedOnce: Boolean
+        get() = sp.getBoolean("thanked_once", false)
+        set(v) = sp.edit().putBoolean("thanked_once", v).apply()
+}

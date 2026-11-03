@@ -1,0 +1,125 @@
+.PHONY: all build build-helper install clean run android adb edid status stop list dist setup-system publish release-metadata
+
+VERSION = 1.2.12
+
+CARGO = cargo
+CC = gcc
+ADB = adb
+BIN_DIR = ${HOME}/.local/bin
+DATA_DIR = ${HOME}/.local/share/uscreen
+
+all: build
+
+# Generic -O3 (no -march=native): release binaries must run on any x86-64 CPU
+build-helper:
+	$(CC) -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c host/evdi/uscreen_convert.c -levdi -lpthread -Ihost/evdi
+	@echo "✓ EVDI helper: host/evdi/evdi_helper"
+
+build: build-helper
+	$(CARGO) build --release
+	@echo "✓ Binaries: $(PWD)/target/release/uscreen and uscreen-gui"
+
+install: build edid
+	mkdir -p $(BIN_DIR) $(DATA_DIR)/edid
+	# rm first: cp into a running binary fails with "text file busy"
+	rm -f $(BIN_DIR)/uscreen $(BIN_DIR)/uscreen-gui $(BIN_DIR)/evdi_helper
+	cp target/release/uscreen $(BIN_DIR)/uscreen
+	cp target/release/uscreen-gui $(BIN_DIR)/uscreen-gui
+	cp host/evdi/evdi_helper $(BIN_DIR)/evdi_helper
+	cp edid/s9ultra.bin $(DATA_DIR)/edid/
+	@echo "✓ Installed to $(BIN_DIR)/uscreen, $(BIN_DIR)/uscreen-gui and $(BIN_DIR)/evdi_helper"
+	mkdir -p ${HOME}/.local/share/applications
+	cp scripts/uscreen.desktop ${HOME}/.local/share/applications/ 2>/dev/null || true
+	mkdir -p ${HOME}/.local/share/icons/hicolor/scalable/apps
+	cp packaging/icons/uscreen.svg packaging/icons/uscreen-pen.svg ${HOME}/.local/share/icons/hicolor/scalable/apps/ 2>/dev/null || true
+	@echo "✓ Desktop entry and icons installed (UScreen in the app menu)"
+	mkdir -p ${HOME}/.config/systemd/user/ 2>/dev/null || true
+	cp scripts/uscreen.service ${HOME}/.config/systemd/user/ 2>/dev/null || true
+	systemctl --user daemon-reload 2>/dev/null || true
+	@echo "✓ systemd user service installed"
+
+# One-time system setup (needs sudo): pre-create an EVDI device at boot so
+# the daemon never needs root, and load the required modules.
+setup-system:
+	echo "options evdi initial_device_count=1" | sudo tee /etc/modprobe.d/uscreen-evdi.conf
+	printf "evdi\nuinput\n" | sudo tee /etc/modules-load.d/uscreen.conf
+	sudo modprobe evdi || true
+	sudo modprobe uinput || true
+	@if [ "$$(cat /sys/devices/evdi/count 2>/dev/null || echo 0)" = "0" ]; then \
+		echo 1 | sudo tee /sys/devices/evdi/add; \
+	fi
+	@echo "✓ System setup done (EVDI device available now and at every boot)"
+
+run: build
+	sudo modprobe -q evdi || true
+	sudo modprobe -q uinput || true
+	./target/release/uscreen start
+
+adb:
+	$(ADB) reverse tcp:8890 tcp:8890
+	$(ADB) reverse tcp:8891 tcp:8891
+	@echo "✓ ADB ports: 8890 (video), 8891 (input)"
+
+android:
+	cd android && ./gradlew assembleDebug --no-daemon
+	@echo "✓ APK: android/app/build/outputs/apk/debug/app-debug.apk"
+
+android-install: android
+	$(ADB) install -r android/app/build/outputs/apk/debug/app-debug.apk
+	@echo "✓ APK installed on device"
+
+edid:
+	mkdir -p edid
+	python3 scripts/gen-edid.py 2960 1848 60 edid/s9ultra.bin
+	@echo "✓ EDID generated: edid/s9ultra.bin"
+
+list:
+	./target/release/uscreen list-displays
+
+status:
+	./target/release/uscreen status
+
+stop:
+	./target/release/uscreen stop
+
+# Release tarball: prebuilt binaries + installer. Upload to GitHub releases
+# together with the release APK (android/app/build/outputs/apk/release/).
+# Publish a complete release: builds everything, refuses if any of the five
+# files is missing, then creates the GitHub release and uploads them all.
+# Usage: GH_TOKEN=... make publish NOTES=path/to/notes.md
+publish:
+	./scripts/publish-release.sh $(NOTES)
+
+# Write VERSION and the release date into the website, llms.txt, sitemap and
+# CITATION.cff. Usage: make release-metadata DATE=2026-09-15 (default: today)
+release-metadata:
+	./scripts/update-release-metadata.sh $(VERSION) $(or $(DATE),$(shell date +%F))
+
+dist:
+	@# Portable binaries (built against Debian 12 glibc) when the build
+	@# container exists; otherwise a local build, which only runs on
+	@# distributions at least as new as this machine.
+	@if distrobox list 2>/dev/null | grep -q ' uscreen-build '; then \
+		./scripts/build-release.sh && ./packaging/build-packages.sh; \
+	else \
+		echo "!! no uscreen-build container: building locally (NOT portable — see scripts/build-release.sh)"; \
+		$(MAKE) dist-local; \
+	fi
+
+dist-local: build
+	rm -rf dist/uscreen-$(VERSION)
+	mkdir -p dist/uscreen-$(VERSION)/bin dist/uscreen-$(VERSION)/scripts dist/uscreen-$(VERSION)/packaging
+	cp target/release/uscreen target/release/uscreen-gui host/evdi/evdi_helper dist/uscreen-$(VERSION)/bin/
+	cp scripts/install.sh scripts/uscreen.desktop scripts/uscreen.service dist/uscreen-$(VERSION)/scripts/
+	cp packaging/uscreen-evdi.conf packaging/uscreen-modules.conf packaging/uscreen.service packaging/60-uscreen-uinput.rules dist/uscreen-$(VERSION)/packaging/
+	mkdir -p dist/uscreen-$(VERSION)/packaging/icons && cp packaging/icons/uscreen.svg packaging/icons/uscreen-pen.svg dist/uscreen-$(VERSION)/packaging/icons/
+	cp README.md dist/uscreen-$(VERSION)/
+	cd android && ./gradlew assembleRelease -q && cp app/build/outputs/apk/release/app-release.apk ../dist/uscreen-$(VERSION)/uscreen.apk 2>/dev/null || true
+	tar -C dist -czf dist/uscreen-$(VERSION)-linux-x86_64.tar.gz uscreen-$(VERSION)
+	@echo "✓ Release: dist/uscreen-$(VERSION)-linux-x86_64.tar.gz"
+
+clean:
+	cd host && $(CARGO) clean
+	rm -f host/evdi/evdi_helper
+	rm -rf dist
+	@echo "✓ Cleaned"

@@ -1,0 +1,1295 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <poll.h>
+#include <errno.h>
+#include <time.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <stdint.h>
+/* Only the public client API. The headers are upstream libevdi 1.15's, kept
+   in sync with the library: the previous copies predated the
+   ddcci_data_handler member of evdi_event_context, so a struct one pointer
+   too short was being handed to a library that reads that member. */
+#include "evdi_lib.h"
+
+static evdi_handle g_handle = EVDI_INVALID_HANDLE;
+static int g_device_index = -1;
+static volatile int g_running = 1;
+
+static int g_capture_fifo_fd = -1;
+static const char *g_fifo_path = NULL;
+static int g_fps = 60;
+
+/* EVDI-registered framebuffer (stride-padded, written by the kernel) */
+static unsigned char *g_framebuffer = NULL;
+static int g_fb_size = 0;
+static int g_mode_w = 0;
+static int g_mode_h = 0;
+static int g_mode_bpp = 4;
+static int g_mode_stride = 0;
+static volatile int g_have_mode = 0;
+static int g_pin_card = -1;
+static int g_dpms_on = 0;
+
+/* Triple buffer for FIFO writes: grabber packs into g_fill, swaps with
+   g_latest; writer swaps g_latest into g_write and streams it out.
+   Pointer swaps only — no copies between threads, no stalls. */
+static pthread_mutex_t g_swap_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Signalled by publish_frame() so the writer wakes the moment a frame exists
+   rather than on its own timer — see writer_thread(). */
+/* Initialised in main() against CLOCK_MONOTONIC.
+   NOT PTHREAD_COND_INITIALIZER: that condvar measures absolute timeouts
+   against CLOCK_REALTIME, while the deadlines here come from
+   CLOCK_MONOTONIC. Monotonic time is seconds-since-boot and realtime is
+   seconds-since-1970, so every deadline looked decades overdue,
+   pthread_cond_timedwait returned ETIMEDOUT immediately and the writer
+   thread spun at ~65% of a core doing nothing. */
+static pthread_cond_t g_frame_ready;
+static unsigned char *g_fill = NULL;
+static unsigned char *g_latest = NULL;
+static unsigned char *g_write = NULL;
+static volatile int g_latest_valid = 0;
+
+/* Per-buffer "which chroma rows are out of date in THIS buffer", one bit per
+   chroma row. Converting the whole frame every time is wasted work: a desktop
+   typically changes a small band, and EVDI already tells us which.
+   Why per buffer rather than one global list: with triple buffering each
+   buffer was last filled at a different moment, so each is stale in a
+   different set of rows. A single shared list would leave whichever buffer
+   was skipped holding torn, half-updated content. Damage is therefore
+   recorded into all three, and cleared only for the buffer just converted.
+   The masks swap together with the buffer pointers they describe. */
+static unsigned char *g_dirty_fill = NULL;
+static unsigned char *g_dirty_latest = NULL;
+static unsigned char *g_dirty_write = NULL;
+static int g_dirty_bytes = 0;      /* size of one mask */
+static int g_chroma_rows = 0;      /* mode height / 2 */
+static int g_packed_size = 0;          /* NV12 frame: out_w*out_h*3/2 */
+/* PASSTHROUGH: hand the raw BGRA frame to the encoder and let the GPU do the
+   colour conversion (VAAPI VPP). Costs 22.5 MB/frame through the FIFO but
+   removes the CPU conversion entirely — measured 69fps for the GPU path. */
+static int g_passthrough_bgra = 0;
+
+/* Integer downscale applied on the way to the encoder. The desktop keeps its
+   native mode — window layout and scaling are unaffected — while the stream
+   carries fewer pixels. That cuts both the bytes crossing into the encoder and
+   the tablet's decode time, which measurements put at roughly 7-8ms fixed plus
+   1.2ms per megapixel. An integer divisor means the tablet upscales by a whole
+   number, avoiding resampling artefacts on top of the softness.
+   1 = native, and keeps the original tight conversion loop. */
+static int g_scale = 1;
+static int g_out_w = 0;
+static int g_out_h = 0;
+static volatile int g_buffers_ready = 0;
+
+/* How long an unchanged screen may go without a frame being re-sent.
+   This is not just about the client's read timeout. The encoder's keyframe
+   interval (-g) counts frames, not seconds, so the slower we feed it while
+   idle, the longer the wall-clock gap between IDRs — and a client that joins
+   or recovers from a drop cannot start decoding until one arrives. At 200ms
+   the idle floor is 5fps, which keeps that gap bounded at a few seconds while
+   still cutting idle work by an order of magnitude.
+   The real fix is requesting an IDR on demand, which needs the in-process
+   encoder rather than a pipe into the ffmpeg CLI. */
+#define IDLE_KEEPALIVE_MS 200
+static long long g_last_write_ms = 0;
+
+static long long now_us(void);
+/* Capture-side latency: grab → NV12 → handed to the encoder's FIFO.
+   Reported as percentiles so the cost of the pipe-to-ffmpeg design can be
+   compared against the decode and wire costs measured on the other side. */
+#define LAT_SAMPLES 256
+static int g_lat_us[LAT_SAMPLES];
+static int g_lat_count = 0;
+static long long g_grab_us = 0;      /* when the frame now in g_fill was grabbed */
+static long long g_latest_grab_us = 0;
+static long long g_write_grab_us = 0;
+
+static int cmp_int(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static volatile int g_update_pending = 0;  /* request_update sent, waiting for update_ready */
+static volatile int g_writer_busy = 0;     /* writer is streaming g_write to the FIFO */
+static volatile int g_mode_generation = 0; /* bumped on every mode change */
+static volatile long long g_grab_count = 0;
+
+/* Where the capture cycle spends its time, printed with the 5s stats. The
+   two halves of the cycle are the wait for the compositor to answer a
+   request and the copy out of the framebuffer; knowing both is what tells
+   a slow compositor from a slow helper. */
+static long long g_req_us = 0;          /* when the outstanding request was sent */
+static long long g_wait_sum_us = 0;     /* request → update_ready */
+static int g_wait_n = 0;
+static long long g_conv_sum_us = 0;     /* bgra_to_nv12 duration (wall) */
+static int g_conv_n = 0;
+static long long g_fifo_sum_us = 0;     /* poll+write into the FIFO */
+static int g_fifo_n = 0;
+static long long g_grab_sum_us = 0;     /* evdi_grab_pixels duration */
+static int g_grab_n = 0;
+static int g_immediate_n = 0;           /* requests the kernel answered at once */
+static int g_empty_n = 0;               /* grabs that returned no damaged rects */
+/* Request the next frame as soon as the previous one has been grabbed
+   instead of waiting for the next period tick. USCREEN_NO_PIPELINE=1 restores
+   the strictly paced cycle for comparison. */
+static int g_pipeline = 1;
+static volatile long long g_last_request_ms = 0;
+
+static void handle_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static long long now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void on_dpms(int dpms_mode, void *user_data) {
+    (void)user_data;
+    g_dpms_on = (dpms_mode == 0) ? 1 : 0;
+    fprintf(stderr, "[evdi-helper] DPMS: %d (%s)\n", dpms_mode, g_dpms_on ? "ON" : "OFF");
+}
+
+/* --- BGRA -> NV12 conversion -------------------------------------------
+   The kernel hands us a 32-bit BGRA framebuffer (21.9 MB at 2960x1848).
+   Feeding that raw to the encoder is memory-bandwidth bound: it gets copied
+   three times per frame (pack + pipe write + pipe read), which caps the
+   pipeline around 70 fps even though NVENC itself sits near-idle. NV12 is
+   1.5 bytes/px (8.2 MB) — 2.7x less data through every stage — and NVENC
+   accepts it natively, so the encoder no longer color-converts either.
+
+   Conversion uses BT.709 limited-range coefficients (matching the bt709 and
+   `-color_range tv` tags the encoder writes) and is split across a small
+   thread pool so it costs ~1 ms rather than stalling the capture loop.
+
+   Full range was tried and reverted. It is theoretically better — 256 levels
+   instead of 220 — but this tablet's decoder does not act on the SPS
+   full-range flag even when the format also declares COLOR_RANGE_FULL: it
+   assumes limited range, stretches the levels downwards and visibly crushes
+   shadows. Limited range costs precision, not range (the decoder expands
+   16-235 back to 0-255), so the only real exposure is slight banding in
+   gradients, which is the lesser problem by a wide margin. */
+
+/* Byte offsets of the red, green and blue samples inside one 32-bit pixel.
+   The framebuffer is not always BGRA: the compositor picks the DRM format and
+   libevdi reports it in the mode event. ARGB8888/XRGB8888 are B,G,R,x in
+   memory (the default); ABGR8888/XBGR8888 are R,G,B,x. Reading the second as
+   the first swaps red and blue — a blue desktop arrives orange on the tablet.
+   Only changed from the mode callback, which runs on the thread that also
+   dispatches conversions, so the workers never see it change under them. */
+extern int uscreen_argb_to_nv12(const unsigned char *src, int src_stride,
+                                    unsigned char *y, int y_stride,
+                                    unsigned char *uv, int uv_stride,
+                                    int width, int height, int argb_order);
+static int g_off_r = 2, g_off_g = 1, g_off_b = 0;
+
+#define FOURCC(a, b, c, d) ((unsigned)(a) | ((unsigned)(b) << 8) | \
+                            ((unsigned)(c) << 16) | ((unsigned)(d) << 24))
+
+static void set_pixel_order(unsigned int fmt) {
+    int r = 2, g = 1, b = 0, known = 1;
+    switch (fmt) {
+    case FOURCC('A','R','2','4'): case FOURCC('X','R','2','4'):  /* B,G,R,x */
+        break;
+    case FOURCC('A','B','2','4'): case FOURCC('X','B','2','4'):  /* R,G,B,x */
+        r = 0; g = 1; b = 2; break;
+    case FOURCC('R','A','2','4'): case FOURCC('R','X','2','4'):  /* x,B,G,R */
+        r = 3; g = 2; b = 1; break;
+    case FOURCC('B','A','2','4'): case FOURCC('B','X','2','4'):  /* x,R,G,B */
+        r = 1; g = 2; b = 3; break;
+    default:
+        known = 0;      /* 0 = not reported by an old libevdi: keep BGRA */
+        break;
+    }
+    if (g_off_r != r || g_off_b != b)
+        fprintf(stderr, "[evdi-helper] Pixel format 0x%x: red at byte %d, blue at byte %d\n",
+                fmt, r, b);
+    if (!known && fmt != 0)
+        fprintf(stderr, "[evdi-helper] Unknown pixel format 0x%x — assuming BGRA\n", fmt);
+    g_off_r = r; g_off_g = g; g_off_b = b;
+}
+
+typedef struct {
+    const unsigned char *src;   /* 32-bit pixels, stride-padded; see g_off_* */
+    unsigned char *ydst;        /* Y plane, w bytes/row */
+    unsigned char *uvdst;       /* interleaved CbCr, w bytes per chroma row */
+    int w, h, stride;           /* source dimensions */
+    int ow, oh;                 /* destination dimensions (w/scale, h/scale) */
+    int scale;                  /* 1 = no downscale */
+    int cy0, cy1;               /* chroma-row range [cy0, cy1) this job owns */
+    const unsigned char *dirty; /* NULL = convert everything */
+} conv_job_t;
+
+static inline int row_is_dirty(const unsigned char *mask, int cy) {
+    return mask == NULL || (mask[cy >> 3] & (1u << (cy & 7)));
+}
+
+/* Downscaling variant: every output pixel is the mean of a scale x scale
+   source block, and each chroma sample the mean of the 2*scale square it
+   covers. Box averaging rather than point sampling — dropping pixels would
+   alias hard on desktop content, where single-pixel lines are everywhere. */
+/* Mean (b,g,r) of every output pixel of source rows [src_y0, src_y0 + n).
+
+   Two colour channels are summed per 32-bit add: a pixel is split into its
+   even bytes (v & 0x00FF00FF) and odd bytes ((v >> 8) & 0x00FF00FF), each
+   pair sitting in its own 16-bit lane, so a whole n x n block (n <= 4, at
+   most 16 x 255) is summed without a lane overflowing. Loading and
+   zero-extending single bytes one channel at a time was what made the scaled
+   path four times slower per pixel than the unscaled one. The block size is a
+   compile-time constant in the common cases, so the inner loop unrolls and
+   the division by n*n becomes a shift or a multiply. */
+typedef uint32_t __attribute__((may_alias)) u32a;
+#define SWAR_LANES 0x00FF00FFu
+
+#define SWAR_ROWS(N)                                                           \
+    for (int dy = 0; dy < (N); dy++) {                                         \
+        const u32a *row = (const u32a *)(src + (size_t)(src_y0 + dy) * stride);\
+        for (int ox = 0; ox < ow; ox++) {                                      \
+            const u32a *px = row + (size_t)ox * (N);                           \
+            uint32_t se = 0, so = 0;                                           \
+            for (int dx = 0; dx < (N); dx++) {                                 \
+                uint32_t v = px[dx];                                           \
+                se += v & SWAR_LANES;                                          \
+                so += (v >> 8) & SWAR_LANES;                                   \
+            }                                                                  \
+            e[ox] += se; o[ox] += so;                                          \
+        }                                                                      \
+    }
+
+static inline int swar_channel(uint32_t e, uint32_t o, int byte) {
+    uint32_t w = (byte & 1) ? o : e;
+    return (int)((w >> ((byte >> 1) * 16)) & 0xFFFF);
+}
+
+#define MEAN_MAX_OW 4096
+static inline void scaled_row_means(const unsigned char *src, int stride, int ow,
+                                    int n, int src_y0, int ob, int og, int or_,
+                                    int *acc) {
+    uint32_t e[MEAN_MAX_OW], o[MEAN_MAX_OW];
+    memset(e, 0, (size_t)ow * sizeof(uint32_t));
+    memset(o, 0, (size_t)ow * sizeof(uint32_t));
+    switch (n) {
+    case 2: SWAR_ROWS(2) break;
+    case 3: SWAR_ROWS(3) break;
+    case 4: SWAR_ROWS(4) break;
+    default: SWAR_ROWS(n) break;
+    }
+    const int inv = n * n;
+    switch (n) {
+    case 2:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 4;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 4;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 4;
+        }
+        break;
+    case 3:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 9;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 9;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 9;
+        }
+        break;
+    case 4:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / 16;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / 16;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / 16;
+        }
+        break;
+    default:
+        for (int ox = 0; ox < ow; ox++) {
+            acc[ox*3]   = swar_channel(e[ox], o[ox], ob) / inv;
+            acc[ox*3+1] = swar_channel(e[ox], o[ox], og) / inv;
+            acc[ox*3+2] = swar_channel(e[ox], o[ox], or_) / inv;
+        }
+    }
+}
+
+/* Per-thread scratch for two output rows of means: 3 channels x up to 4096
+   output pixels (8192 wide at scale 2). */
+static __thread int t_mean0[MEAN_MAX_OW * 3];
+static __thread int t_mean1[MEAN_MAX_OW * 3];
+
+static inline void convert_strip_scaled(const conv_job_t *j) {
+    const int n = j->scale, stride = j->stride, ow = j->ow;
+    const int or_ = g_off_r, og = g_off_g, ob = g_off_b;
+    if (ow > MEAN_MAX_OW) return;           /* mode checks keep it below this */
+    for (int cy = j->cy0; cy < j->cy1; cy++) {
+        if (!row_is_dirty(j->dirty, cy))
+            continue;
+        unsigned char *yo0 = j->ydst + (size_t)(cy * 2) * ow;
+        unsigned char *yo1 = yo0 + ow;
+        unsigned char *uv  = j->uvdst + (size_t)cy * ow;
+        /* The two output luma rows this chroma row covers. */
+        scaled_row_means(j->src, stride, ow, n, (cy * 2) * n, ob, og, or_, t_mean0);
+        scaled_row_means(j->src, stride, ow, n, (cy * 2 + 1) * n, ob, og, or_, t_mean1);
+        for (int ox = 0; ox < ow; ox += 2) {
+            const int *m00 = t_mean0 + ox * 3, *m01 = t_mean0 + (ox + 1) * 3;
+            const int *m10 = t_mean1 + ox * 3, *m11 = t_mean1 + (ox + 1) * 3;
+            yo0[ox]     = (unsigned char)(((47 * m00[2] + 157 * m00[1] + 16 * m00[0] + 128) >> 8) + 16);
+            yo0[ox + 1] = (unsigned char)(((47 * m01[2] + 157 * m01[1] + 16 * m01[0] + 128) >> 8) + 16);
+            yo1[ox]     = (unsigned char)(((47 * m10[2] + 157 * m10[1] + 16 * m10[0] + 128) >> 8) + 16);
+            yo1[ox + 1] = (unsigned char)(((47 * m11[2] + 157 * m11[1] + 16 * m11[0] + 128) >> 8) + 16);
+            int ab = (m00[0] + m01[0] + m10[0] + m11[0]) >> 2;
+            int ag = (m00[1] + m01[1] + m10[1] + m11[1]) >> 2;
+            int ar = (m00[2] + m01[2] + m10[2] + m11[2]) >> 2;
+            int cb = (((-25 * ar - 87 * ag + 112 * ab + 128) >> 8) + 128);
+            int cr = (((112 * ar - 102 * ag - 10 * ab + 128) >> 8) + 128);
+            if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
+            if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
+            uv[ox]     = (unsigned char)cb;
+            uv[ox + 1] = (unsigned char)cr;
+        }
+    }
+}
+
+static inline void convert_strip(const conv_job_t *j) {
+    const int w = j->w, stride = j->stride;
+    const int or_ = g_off_r, og = g_off_g, ob = g_off_b;
+    for (int cy = j->cy0; cy < j->cy1; cy++) {
+        if (!row_is_dirty(j->dirty, cy))
+            continue;
+        int y0 = cy * 2, y1 = y0 + 1;
+        const unsigned char *row0 = j->src + (size_t)y0 * stride;
+        const unsigned char *row1 = j->src + (size_t)y1 * stride;
+        unsigned char *yo0 = j->ydst + (size_t)y0 * w;
+        unsigned char *yo1 = j->ydst + (size_t)y1 * w;
+        unsigned char *uv  = j->uvdst + (size_t)cy * w;
+        for (int x = 0; x < w; x += 2) {
+            const unsigned char *p;
+            int b, g, r, sb, sg, sr;
+            p = row0 + (size_t)x * 4;       b = p[ob]; g = p[og]; r = p[or_];
+            yo0[x]   = (unsigned char)(((47*r + 157*g + 16*b + 128) >> 8) + 16);
+            sb = b; sg = g; sr = r;
+            p = row0 + (size_t)(x+1) * 4;   b = p[ob]; g = p[og]; r = p[or_];
+            yo0[x+1] = (unsigned char)(((47*r + 157*g + 16*b + 128) >> 8) + 16);
+            sb += b; sg += g; sr += r;
+            p = row1 + (size_t)x * 4;       b = p[ob]; g = p[og]; r = p[or_];
+            yo1[x]   = (unsigned char)(((47*r + 157*g + 16*b + 128) >> 8) + 16);
+            sb += b; sg += g; sr += r;
+            p = row1 + (size_t)(x+1) * 4;   b = p[ob]; g = p[og]; r = p[or_];
+            yo1[x+1] = (unsigned char)(((47*r + 157*g + 16*b + 128) >> 8) + 16);
+            sb += b; sg += g; sr += r;
+            int ar = sr >> 2, ag = sg >> 2, ab = sb >> 2;  /* 2x2 chroma average */
+            int cb = (((-25*ar - 87*ag + 112*ab + 128) >> 8) + 128);
+            int cr = (((112*ar - 102*ag - 10*ab + 128) >> 8) + 128);
+            if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
+            if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
+            uv[x]   = (unsigned char)cb;
+            uv[x+1] = (unsigned char)cr;
+        }
+    }
+}
+
+#define MAX_CONV_THREADS 8
+static int g_nthreads = 1;
+static pthread_t g_pool[MAX_CONV_THREADS];
+static conv_job_t g_jobs[MAX_CONV_THREADS];
+static pthread_mutex_t g_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pool_go = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_pool_done = PTHREAD_COND_INITIALIZER;
+static int g_pool_gen = 0;       /* bumped to dispatch a frame */
+static int g_pool_active = 0;    /* worker jobs still running this gen */
+static int g_pool_shutdown = 0;
+
+static void *conv_worker(void *arg) {
+    int id = (int)(intptr_t)arg;
+    int last_gen = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_pool_mtx);
+        while (g_pool_gen == last_gen && !g_pool_shutdown)
+            pthread_cond_wait(&g_pool_go, &g_pool_mtx);
+        if (g_pool_shutdown) { pthread_mutex_unlock(&g_pool_mtx); break; }
+        last_gen = g_pool_gen;
+        pthread_mutex_unlock(&g_pool_mtx);
+
+        if (g_jobs[id].scale > 1) convert_strip_scaled(&g_jobs[id]);
+        else convert_strip(&g_jobs[id]);
+
+        pthread_mutex_lock(&g_pool_mtx);
+        if (--g_pool_active == 0)
+            pthread_cond_signal(&g_pool_done);
+        pthread_mutex_unlock(&g_pool_mtx);
+    }
+    return NULL;
+}
+
+static void conv_pool_init(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    g_nthreads = (int)(n - 2);              /* leave cores for ffmpeg/KWin */
+    if (g_nthreads < 1) g_nthreads = 1;
+    if (g_nthreads > MAX_CONV_THREADS) g_nthreads = MAX_CONV_THREADS;
+    /* Worker threads handle jobs 1..n-1; the caller runs job 0 itself. */
+    for (int i = 1; i < g_nthreads; i++)
+        pthread_create(&g_pool[i], NULL, conv_worker, (void *)(intptr_t)i);
+    fprintf(stderr, "[evdi-helper] NV12 conversion using %d thread(s)\n", g_nthreads);
+}
+
+static void bgra_to_nv12(const unsigned char *src, unsigned char *dst,
+                         const unsigned char *dirty) {
+    /* Fast path: libyuv's AVX2 ARGB->NV12 does 3000x1872 in ~3.4ms, while the
+       portable SWAR loop below needs 8-11ms for the same frame. Damage is
+       ignored here — at this speed reconverting the whole frame is cheaper
+       than the bookkeeping needed to track bands. */
+    if (g_scale == 1 && g_mode_w == g_out_w && g_mode_h == g_out_h) {
+        unsigned char *yfast = dst;
+        unsigned char *uvfast = dst + (size_t)g_out_w * g_out_h;
+        int rc = uscreen_argb_to_nv12(src, g_mode_stride, yfast, g_out_w,
+                                      uvfast, g_out_w, g_out_w, g_out_h,
+                                      (g_off_r == 2 && g_off_b == 0) ? 1 : 0);
+        {
+            static int bench_done = 0;
+            if (!bench_done) {
+                bench_done = 1;
+                long long bt = now_us();
+                for (int i = 0; i < 10; i++)
+                    uscreen_argb_to_nv12(src, g_mode_stride, yfast, g_out_w,
+                                         uvfast, g_out_w, g_out_w, g_out_h,
+                                         (g_off_r == 2 && g_off_b == 0) ? 1 : 0);
+                fprintf(stderr, "[evdi-helper] BENCH libyuv: %.2f ms | rc=%d order=%s | scale=%d mode=%dx%d out=%dx%d stride=%d\n",
+                        (now_us() - bt) / 10000.0, rc,
+                        (g_off_r == 2 && g_off_b == 0) ? "ARGB" : "ABGR",
+                        g_scale, g_mode_w, g_mode_h, g_out_w, g_out_h, g_mode_stride);
+            }
+        }
+        if (rc == 0)
+            return;
+        /* fall through to the portable path if libyuv rejected the frame */
+    }
+    int ch = g_out_h / 2;
+    unsigned char *ydst = dst;
+    unsigned char *uvdst = dst + (size_t)g_out_w * g_out_h;
+    for (int i = 0; i < g_nthreads; i++) {
+        g_jobs[i] = (conv_job_t){ src, ydst, uvdst, g_mode_w, g_mode_h, g_mode_stride,
+                                  g_out_w, g_out_h, g_scale,
+                                  ch * i / g_nthreads, ch * (i + 1) / g_nthreads,
+                                  dirty };
+    }
+    if (g_nthreads > 1) {
+        pthread_mutex_lock(&g_pool_mtx);
+        g_pool_active = g_nthreads - 1;
+        g_pool_gen++;
+        pthread_cond_broadcast(&g_pool_go);
+        pthread_mutex_unlock(&g_pool_mtx);
+    }
+    if (g_jobs[0].scale > 1) convert_strip_scaled(&g_jobs[0]);
+    else convert_strip(&g_jobs[0]);   /* caller does its own strip */
+    if (g_nthreads > 1) {
+        pthread_mutex_lock(&g_pool_mtx);
+        while (g_pool_active > 0)
+            pthread_cond_wait(&g_pool_done, &g_pool_mtx);
+        pthread_mutex_unlock(&g_pool_mtx);
+    }
+}
+
+static void mark_all_dirty(void) {
+    if (!g_dirty_fill) return;
+    memset(g_dirty_fill,   0xFF, (size_t)g_dirty_bytes);
+    memset(g_dirty_latest, 0xFF, (size_t)g_dirty_bytes);
+    memset(g_dirty_write,  0xFF, (size_t)g_dirty_bytes);
+}
+
+/* Record damaged chroma rows into every buffer's mask: each of them now lacks
+   this content until it is individually reconverted. */
+static void mark_damage(const struct evdi_rect *rects, int n) {
+    if (!g_dirty_fill || g_chroma_rows <= 0) return;
+    for (int i = 0; i < n; i++) {
+        int y0 = rects[i].y1, y1 = rects[i].y2;
+        if (y1 < y0) { int t = y0; y0 = y1; y1 = t; }
+        /* Source rows map onto output chroma rows through the scale: one
+           chroma row covers 2*scale source rows. */
+        int div = 2 * g_scale;
+        int c0 = y0 / div, c1 = (y1 + div - 1) / div;
+        if (c0 < 0) c0 = 0;
+        if (c1 > g_chroma_rows) c1 = g_chroma_rows;
+        for (int cy = c0; cy < c1; cy++) {
+            unsigned char bit = (unsigned char)(1u << (cy & 7));
+            g_dirty_fill[cy >> 3]   |= bit;
+            g_dirty_latest[cy >> 3] |= bit;
+            g_dirty_write[cy >> 3]  |= bit;
+        }
+    }
+}
+
+/* Convert the stride-padded BGRA framebuffer into the NV12 fill buffer and
+   publish it as the latest frame. Called from the event-loop thread. */
+static void publish_frame(void) {
+    if (!g_buffers_ready || !g_framebuffer)
+        return;
+
+    /* Only the rows this particular buffer is missing. */
+    {
+        long long _t_conv = now_us();
+        if (g_passthrough_bgra) {
+            for (int y = 0; y < g_mode_h; y++)
+                memcpy(g_fill + (size_t)y * g_mode_w * 4,
+                       g_framebuffer + (size_t)y * g_mode_stride,
+                       (size_t)g_mode_w * 4);
+        } else {
+            bgra_to_nv12(g_framebuffer, g_fill, g_dirty_fill);
+        }
+        g_conv_sum_us += now_us() - _t_conv;
+        g_conv_n++;
+    }
+    memset(g_dirty_fill, 0, (size_t)g_dirty_bytes);
+
+    pthread_mutex_lock(&g_swap_mutex);
+    unsigned char *tmp = g_latest;
+    g_latest = g_fill;
+    g_fill = tmp;
+    /* The masks describe the buffers, so they travel with them. */
+    unsigned char *dtmp = g_dirty_latest;
+    g_dirty_latest = g_dirty_fill;
+    g_dirty_fill = dtmp;
+    g_latest_valid = 1;
+    g_latest_grab_us = g_grab_us;
+    pthread_cond_signal(&g_frame_ready);
+    pthread_mutex_unlock(&g_swap_mutex);
+}
+
+static int g_buffer_registered = 0;
+
+static void on_mode_changed(struct evdi_mode mode, void *user_data) {
+    (void)user_data;
+    fprintf(stderr, "[evdi-helper] Mode: %dx%d@%dHz %dbpp fmt=0x%x\n",
+            mode.width, mode.height, mode.refresh_rate,
+            mode.bits_per_pixel, mode.pixel_format);
+    printf("MODE_CHANGED %d %d %d\n", mode.width, mode.height, mode.refresh_rate);
+    fflush(stdout);
+
+    /* Before the "unchanged" early return below: a compositor can switch
+       format without changing the size. Conversions are not running during a
+       mode event, so the next frame simply uses the new order. */
+    set_pixel_order(mode.pixel_format);
+    mark_all_dirty();
+
+    int new_w = mode.width;
+    int new_h = mode.height;
+    int new_bpp = mode.bits_per_pixel / 8;
+    if (new_bpp < 1) new_bpp = 4;
+
+    /* Same geometry (KWin re-applying the mode)? Keep everything as-is.
+       Re-registering on every event is what crashed libevdi before. */
+    if (g_buffer_registered && new_w == g_mode_w && new_h == g_mode_h
+            && new_bpp == g_mode_bpp) {
+        fprintf(stderr, "[evdi-helper] Mode unchanged, keeping buffer\n");
+        g_update_pending = 0;
+        return;
+    }
+
+    g_mode_w = new_w;
+    g_mode_h = new_h;
+    g_mode_bpp = new_bpp;
+
+    int row_bytes = g_mode_w * g_mode_bpp;
+    int aligned_stride = (row_bytes + 63) & ~63;  /* DRM buffers are 64-byte aligned */
+    g_mode_stride = aligned_stride;
+    g_fb_size = g_mode_stride * g_mode_h;
+
+    pthread_mutex_lock(&g_swap_mutex);
+    g_latest_valid = 0;
+    g_buffers_ready = 0;
+    g_mode_generation++;
+    pthread_mutex_unlock(&g_swap_mutex);
+
+    /* Wait (bounded) for the writer to finish any in-flight write before
+       freeing the buffer it's reading. Writer stalls are bounded because
+       FIFO writes poll with a timeout, but never spin here forever — a
+       stuck event loop blocks KWin's output handling. */
+    for (int i = 0; i < 1000 && g_writer_busy; i++)
+        usleep(1000);
+    if (g_writer_busy) {
+        fprintf(stderr, "[evdi-helper] Writer stuck during mode change — leaking old buffers\n");
+        /* Deliberately leak instead of freeing under the writer: a one-off
+           leak beats a use-after-free. */
+        g_fill = NULL;
+        g_latest = NULL;
+        g_write = NULL;
+    }
+
+    /* The kernel must drop its reference to the old framebuffer BEFORE we
+       free it — freeing first is a use-after-free during a pending grab. */
+    if (g_buffer_registered) {
+        evdi_unregister_buffer(g_handle, 0);
+        g_buffer_registered = 0;
+    }
+
+    free(g_framebuffer);
+    /* The kernel copies the damaged part of the scanout buffer into this
+       on every grab — the whole 22 MB when the compositor reports full
+       damage, which KWin does for this output. That copy is a large share
+       of the capture cycle (measured 4-7 ms at 2960x1848), and copy_to_user
+       into ordinary 4 KiB pages pays a TLB miss every page. Ask for
+       transparent huge pages and touch the memory once now, so the copies
+       run over 2 MiB mappings that are already faulted in. */
+    {
+        size_t huge = 2u << 20;
+        size_t len = ((size_t)g_fb_size + huge - 1) / huge * huge;
+        void *p = NULL;
+        if (posix_memalign(&p, huge, len) == 0 && p) {
+            madvise(p, len, MADV_HUGEPAGE);
+            memset(p, 0, len);
+            g_framebuffer = p;
+        } else {
+            g_framebuffer = malloc(g_fb_size);
+        }
+    }
+
+    /* Stream dimensions: source divided by the scale, forced even because
+       NV12 chroma covers 2x2 luma samples. */
+    g_out_w = (g_mode_w / g_scale) & ~1;
+    g_out_h = (g_mode_h / g_scale) & ~1;
+    if (g_out_w < 2) g_out_w = 2;
+    if (g_out_h < 2) g_out_h = 2;
+
+    /* Packed buffers hold NV12 (Y plane + half-size interleaved CbCr). */
+    g_packed_size = g_passthrough_bgra ? (g_out_w * g_out_h * 4)
+                                      : (g_out_w * g_out_h * 3 / 2);
+    free(g_fill);   g_fill = malloc(g_packed_size);
+    free(g_latest); g_latest = malloc(g_packed_size);
+    free(g_write);  g_write = malloc(g_packed_size);
+
+    /* Fresh buffers hold nothing, so every row is stale in all of them. */
+    g_chroma_rows = g_out_h / 2;
+    g_dirty_bytes = (g_chroma_rows + 7) / 8;
+    free(g_dirty_fill);   g_dirty_fill   = malloc((size_t)g_dirty_bytes);
+    free(g_dirty_latest); g_dirty_latest = malloc((size_t)g_dirty_bytes);
+    free(g_dirty_write);  g_dirty_write  = malloc((size_t)g_dirty_bytes);
+    if (g_dirty_fill && g_dirty_latest && g_dirty_write)
+        mark_all_dirty();
+
+    if (!g_framebuffer || !g_fill || !g_latest || !g_write
+            || !g_dirty_fill || !g_dirty_latest || !g_dirty_write) {
+        fprintf(stderr, "[evdi-helper] Failed to allocate framebuffers\n");
+        g_have_mode = 0;
+        return;
+    }
+
+    /* Dark gray initial frame so the tablet shows something immediately */
+    memset(g_framebuffer, 0x18, g_fb_size);
+
+    struct evdi_buffer buf = {
+        .id = 0,
+        .buffer = g_framebuffer,
+        .width = g_mode_w,
+        .height = g_mode_h,
+        .stride = g_mode_stride,
+        .rects = NULL,
+        .rect_count = 0,
+    };
+    evdi_register_buffer(g_handle, buf);
+    g_buffer_registered = 1;
+
+    pthread_mutex_lock(&g_swap_mutex);
+    g_buffers_ready = 1;
+    pthread_cond_signal(&g_frame_ready);
+    pthread_mutex_unlock(&g_swap_mutex);
+    publish_frame();
+
+    g_have_mode = 1;
+    g_update_pending = 0;
+    fprintf(stderr, "[evdi-helper] Buffer 0 registered: %dx%d stride=%d (row_bytes=%d)\n",
+            g_mode_w, g_mode_h, buf.stride, row_bytes);
+}
+
+static void grab_now(void) {
+    struct evdi_rect rects[64];
+    int num_rects = 64;
+    long long t0 = now_us();
+    evdi_grab_pixels(g_handle, rects, &num_rects);
+    g_grab_sum_us += now_us() - t0;
+    g_grab_n++;
+    if (num_rects <= 0) g_empty_n++;
+    if (num_rects > 0) {
+        g_grab_count++;
+        g_grab_us = now_us();
+        /* Under the swap lock: the writer thread reassigns the mask pointers
+           when it takes a frame, so touching them unlocked would race.
+           If the driver returned more rectangles than we gave it room for,
+           we cannot know what else changed — repaint everything. */
+        pthread_mutex_lock(&g_swap_mutex);
+        if (num_rects >= (int)(sizeof(rects) / sizeof(rects[0])))
+            mark_all_dirty();
+        else
+            mark_damage(rects, num_rects);
+        pthread_mutex_unlock(&g_swap_mutex);
+        publish_frame();
+    }
+}
+
+static void on_update_ready(int buffer_to_be_updated, void *user_data) {
+    (void)user_data;
+    (void)buffer_to_be_updated;
+    if (g_update_pending) {
+        g_wait_sum_us += now_us() - g_req_us;
+        g_wait_n++;
+    }
+    g_update_pending = 0;
+    grab_now();
+    /* Ask for the next frame straight away rather than at the next tick of
+       the target period. The cycle is serial by the driver's design — the
+       compositor's flip only completes once we have copied the frame out,
+       and it renders the next one after that — so at 2960x1848 the two
+       halves (about 9 ms in KWin, 6 ms in the grab) already take a frame
+       period or more. Gating the request on the period as well pushed the
+       next request past the compositor's vblank slot, so a 30 fps target
+       delivered 24 and a 90 fps target 50-ish. The mode's refresh rate is
+       what paces the compositor; nothing here needs to hold it back. Asking
+       first from inside this handler, before the grab, was tried and is
+       worse (16 fps): the driver answers at once with the not-yet-grabbed
+       damage and the cycle falls apart. */
+    if (g_pipeline)
+        g_last_request_ms = 0;
+}
+
+static void on_crtc_state(int state, void *user_data) {
+    (void)user_data;
+    fprintf(stderr, "[evdi-helper] CRTC state: %d\n", state);
+}
+
+static void on_cursor_set(struct evdi_cursor_set cursor_set, void *user_data) {
+    (void)user_data;
+    (void)cursor_set;
+}
+
+static void on_cursor_move(struct evdi_cursor_move cursor_move, void *user_data) {
+    (void)user_data;
+    (void)cursor_move;
+}
+
+/* (Re)open the capture FIFO without blocking forever: O_NONBLOCK open fails
+   with ENXIO while no reader (ffmpeg) has the other end open. */
+static int try_open_fifo(void) {
+    /* O_NOFOLLOW: the path is in a private directory now, but a symlink
+       planted there must still never redirect the screen into a file. */
+    int fd = open(g_fifo_path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    /* Switch back to blocking writes once connected */
+    int flags = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    /* Enlarge the pipe so a full-frame write doesn't take hundreds of
+       64KB round-trips with the encoder. */
+    fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+    fprintf(stderr, "[evdi-helper] Capture FIFO opened\n");
+    return fd;
+}
+
+/* Writer thread: sends the most recent frame, woken by the grabber rather than
+   by a timer, and rate-limited so it never exceeds the target fps.
+
+   The previous version free-ran on clock_nanosleep, entirely independent of
+   when a frame was actually grabbed. A frame published just after a tick had to
+   wait a whole period before being sent — half a frame of pure added latency on
+   average, for nothing. Waiting on the condition variable removes that: the
+   frame goes out as soon as it exists, and the minimum-interval check below
+   still caps the rate.
+
+   Blocking writes here never stall capture, and the FIFO is reopened
+   automatically when the encoder restarts. */
+static void *writer_thread(void *arg) {
+    (void)arg;
+    const long period_ns = 1000000000L / (g_fps > 0 ? g_fps : 60);
+    struct timespec next_allowed;
+    clock_gettime(CLOCK_MONOTONIC, &next_allowed);
+    int have_frame = 0;
+    int frame_generation = -1;
+
+    while (g_running) {
+        if (g_capture_fifo_fd < 0) {
+            g_capture_fifo_fd = try_open_fifo();
+            if (g_capture_fifo_fd < 0) {
+                /* No reader yet — poll slowly instead of spinning. */
+                struct timespec idle = { .tv_sec = 0, .tv_nsec = 50000000L };
+                nanosleep(&idle, NULL);
+                continue;
+            }
+        }
+
+        int size;
+        pthread_mutex_lock(&g_swap_mutex);
+        /* Wait for a frame, but no longer than one period so shutdown and
+           mode changes are still noticed promptly. */
+        while (g_running && (!g_buffers_ready || !g_latest_valid)) {
+            struct timespec wait_until;
+            clock_gettime(CLOCK_MONOTONIC, &wait_until);
+            wait_until.tv_nsec += period_ns;
+            while (wait_until.tv_nsec >= 1000000000L) {
+                wait_until.tv_nsec -= 1000000000L;
+                wait_until.tv_sec += 1;
+            }
+            if (pthread_cond_timedwait(&g_frame_ready, &g_swap_mutex,
+                                       &wait_until) == ETIMEDOUT)
+                break;
+        }
+        if (!g_running) {
+            pthread_mutex_unlock(&g_swap_mutex);
+            break;
+        }
+        if (!g_buffers_ready) {
+            pthread_mutex_unlock(&g_swap_mutex);
+            continue;
+        }
+        if (frame_generation != g_mode_generation) {
+            /* Buffers were reallocated; previous g_write content is gone */
+            frame_generation = g_mode_generation;
+            have_frame = 0;
+        }
+        int fresh = 0;
+        if (g_latest_valid) {
+            unsigned char *tmp = g_write;
+            g_write = g_latest;
+            g_latest = tmp;
+            unsigned char *dtmp = g_dirty_write;
+            g_dirty_write = g_dirty_latest;
+            g_dirty_latest = dtmp;
+            g_latest_valid = 0;
+            g_write_grab_us = g_latest_grab_us;
+            have_frame = 1;
+            fresh = 1;
+        }
+        size = g_packed_size;
+        g_writer_busy = have_frame;
+        pthread_mutex_unlock(&g_swap_mutex);
+
+        if (!have_frame)
+            continue;  /* nothing grabbed yet for this mode */
+
+        /* Nothing changed on screen: don't re-send the identical frame.
+           A motionless desktop was still pushing 60 full NV12 frames a second
+           through the FIFO — 8.2MB each, roughly half a gigabyte per second of
+           pure memory traffic, plus an encode for every one of them, all to
+           transmit no new information. The occasional keepalive keeps the
+           encoder and the client's read timeout alive. */
+        long long now_ms_write = now_ms();
+        if (!fresh && (now_ms_write - g_last_write_ms) < IDLE_KEEPALIVE_MS)
+            continue;
+        g_last_write_ms = now_ms_write;
+
+        /* Rate limit against an absolute schedule, never against "now".
+           Rebasing on now would add the wait and write time to every period,
+           so the stream drifts slower than the target — measured as 58fps
+           against a 60fps target, with ffmpeg reporting speed=0.97x. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long long ahead_ns = (long long)(next_allowed.tv_sec - now.tv_sec) * 1000000000LL
+                           + (next_allowed.tv_nsec - now.tv_nsec);
+        if (ahead_ns > 0) {
+            struct timespec gap = { .tv_sec = ahead_ns / 1000000000LL,
+                                    .tv_nsec = ahead_ns % 1000000000LL };
+            nanosleep(&gap, NULL);
+        } else if (-ahead_ns > 4 * (long long)period_ns) {
+            /* Fallen far behind (a stalled encoder, a mode change): resync
+               instead of trying to catch up on a burst of stale frames. */
+            next_allowed = now;
+        }
+        next_allowed.tv_nsec += period_ns;
+        while (next_allowed.tv_nsec >= 1000000000L) {
+            next_allowed.tv_nsec -= 1000000000L;
+            next_allowed.tv_sec += 1;
+        }
+
+        /* Bounded write: if the encoder stops reading for >250ms per chunk
+           it is stalled or dead — close the FIFO and resync on reopen.
+           An unbounded write() here would wedge the whole helper. */
+        long long _t_fifo = now_us();
+        const unsigned char *ptr = g_write;
+        size_t remaining = (size_t)size;
+        while (remaining > 0 && g_running) {
+            struct pollfd wfd = { .fd = g_capture_fifo_fd, .events = POLLOUT };
+            int pr = poll(&wfd, 1, 250);
+            if (pr <= 0 || (wfd.revents & (POLLERR | POLLHUP))) {
+                fprintf(stderr, "[evdi-helper] Encoder not reading — closing FIFO\n");
+                close(g_capture_fifo_fd);
+                g_capture_fifo_fd = -1;
+                break;
+            }
+            ssize_t written = write(g_capture_fifo_fd, ptr, remaining);
+            if (written <= 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[evdi-helper] FIFO write failed: %s\n", strerror(errno));
+                close(g_capture_fifo_fd);
+                g_capture_fifo_fd = -1;
+                break;
+            }
+            ptr += written;
+            remaining -= (size_t)written;
+        }
+        g_writer_busy = 0;
+        g_fifo_sum_us += now_us() - _t_fifo;
+        g_fifo_n++;
+
+        /* Only freshly grabbed frames say anything about capture latency;
+           keepalive repeats would report the age of stale content. */
+        if (fresh && remaining == 0 && g_write_grab_us > 0
+                && g_lat_count < LAT_SAMPLES) {
+            long long d = now_us() - g_write_grab_us;
+            if (d >= 0 && d < 1000000)
+                g_lat_us[g_lat_count++] = (int)d;
+        }
+    }
+    return NULL;
+}
+
+static void run_event_loop(evdi_handle handle) {
+    struct evdi_event_context evtctx = {
+        .dpms_handler = on_dpms,
+        .mode_changed_handler = on_mode_changed,
+        .update_ready_handler = on_update_ready,
+        .crtc_state_handler = on_crtc_state,
+        .cursor_set_handler = on_cursor_set,
+        .cursor_move_handler = on_cursor_move,
+        .user_data = NULL,
+    };
+
+    struct pollfd fds[1];
+    fds[0].fd = evdi_get_event_ready(handle);
+    fds[0].events = POLLIN;
+
+    long long last_stats_ms = now_ms();
+    long long last_fallback_grab_ms = 0;
+    if (getenv("USCREEN_NO_PIPELINE")) g_pipeline = 0;
+    if (getenv("USCREEN_PASSTHROUGH_BGRA")) {
+        g_passthrough_bgra = 1;
+        fprintf(stderr, "[evdi-helper] PASSTHROUGH: sending BGRA, colour conversion on GPU\n");
+    }
+    long long stats_grab_base = 0;
+    long request_period_ms = 1000 / (g_fps > 0 ? g_fps : 60);
+    if (request_period_ms < 1) request_period_ms = 1;
+
+    while (g_running) {
+        /* Sleep exactly until the next capture request is due instead of a
+           fixed 4ms tick. The fixed tick quantised every request to a 4ms grid,
+           adding up to 4ms of jitter per frame — a quarter of the entire budget
+           at 60fps, and half of it at 120.
+           With no mode there is nothing to request, and the deadline below
+           would sit permanently in the past — poll would return instantly and
+           the loop would spin at 100% of a core. Wait on events only. */
+        int timeout_ms;
+        if (!g_have_mode) {
+            timeout_ms = 100;
+        } else if (g_update_pending) {
+            /* Waiting for update_ready. The capture deadline below has already
+               passed and cannot advance until the request completes, so
+               deriving a timeout from it yields 0 forever and poll returns
+               instantly — the loop then burns a whole core. This is not a
+               rare state: disabling the virtual output leaves a mode set with
+               nothing rendering to it, which is exactly what happens when the
+               tablet is unplugged or switched to pen-only.
+               Sleep until the watchdog is due instead. update_ready wakes poll
+               the moment it arrives, so nothing is delayed when the
+               compositor is actually running. */
+            long long left = g_last_request_ms + 250 - now_ms();
+            timeout_ms = left < 0 ? 0 : (left > 250 ? 250 : (int)left);
+        } else {
+            long long due = g_last_request_ms + request_period_ms;
+            timeout_ms = (int)(due - now_ms());
+            if (timeout_ms < 0) timeout_ms = 0;
+            if (timeout_ms > 4) timeout_ms = 4;   /* stay responsive to events */
+        }
+
+        int ret = poll(fds, 1, timeout_ms);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "[evdi-helper] poll() error: %s\n", strerror(errno));
+            break;
+        }
+
+        if (ret > 0 && (fds[0].revents & POLLIN)) {
+            /* update_ready / mode_changed handlers fire from here */
+            evdi_handle_events(handle, &evtctx);
+        }
+
+        if (!g_have_mode)
+            continue;
+
+        long long now = now_ms();
+
+        /* Core capture cycle: request a fresh frame from the compositor at
+           the target fps. If the kernel says pixels are ready right away,
+           grab immediately; otherwise update_ready will fire and grab. */
+        if (!g_update_pending && (now - g_last_request_ms) >= request_period_ms) {
+            g_last_request_ms = now;
+            g_req_us = now_us();
+            if (evdi_request_update(handle, 0)) {
+                g_immediate_n++;
+                grab_now();
+            } else {
+                g_update_pending = 1;
+            }
+        }
+
+        /* Watchdog: if a request got lost (compositor hiccup), don't stay
+           stuck waiting for update_ready forever. */
+        if (g_update_pending && (now - g_last_request_ms) > 250) {
+            g_update_pending = 0;
+            grab_now();
+        }
+
+        /* Fallback grab once a second in case no events flow at all */
+        if ((now - last_fallback_grab_ms) >= 1000) {
+            last_fallback_grab_ms = now;
+            if (!g_update_pending)
+                grab_now();
+        }
+
+        if (now - last_stats_ms >= 5000) {
+            double elapsed = (now - last_stats_ms) / 1000.0;
+            long long grabs = g_grab_count - stats_grab_base;
+            fprintf(stderr, "[evdi-helper] %.1f grabs/s (total %lld), mode:%d dpms:%d pending:%d\n",
+                    elapsed > 0 ? grabs / elapsed : 0,
+                    g_grab_count, g_have_mode, g_dpms_on, g_update_pending);
+            fprintf(stderr, "[evdi-helper] cycle: request→ready avg %.1fms (%d waited, %d immediate), grab avg %.1fms (%d, %d empty)\n",
+                    g_wait_n ? g_wait_sum_us / 1000.0 / g_wait_n : 0.0, g_wait_n, g_immediate_n,
+                    g_grab_n ? g_grab_sum_us / 1000.0 / g_grab_n : 0.0, g_grab_n, g_empty_n);
+            fprintf(stderr, "[evdi-helper] breakdown: convert avg %.1fms (%d), fifo write avg %.1fms (%d)\n",
+                    g_conv_n ? g_conv_sum_us / 1000.0 / g_conv_n : 0.0, g_conv_n,
+                    g_fifo_n ? g_fifo_sum_us / 1000.0 / g_fifo_n : 0.0, g_fifo_n);
+            g_wait_sum_us = 0; g_wait_n = 0; g_grab_sum_us = 0; g_grab_n = 0;
+            g_conv_sum_us = 0; g_conv_n = 0; g_fifo_sum_us = 0; g_fifo_n = 0;
+            g_immediate_n = 0; g_empty_n = 0;
+
+            /* Capture-side latency: grab → convert → into the encoder's FIFO. */
+            pthread_mutex_lock(&g_swap_mutex);
+            int n = g_lat_count;
+            int snapshot[LAT_SAMPLES];
+            if (n > 0) memcpy(snapshot, g_lat_us, (size_t)n * sizeof(int));
+            g_lat_count = 0;
+            pthread_mutex_unlock(&g_swap_mutex);
+            if (n > 0) {
+                qsort(snapshot, (size_t)n, sizeof(int), cmp_int);
+                fprintf(stderr,
+                        "[evdi-helper] capture→fifo p50 %.1fms p95 %.1fms (%d frames)\n",
+                        snapshot[n / 2] / 1000.0,
+                        snapshot[(int)((n - 1) * 0.95)] / 1000.0, n);
+            }
+
+            stats_grab_base = g_grab_count;
+            last_stats_ms = now;
+        }
+    }
+}
+
+static int find_evdi_device(void) {
+    DIR *dir = opendir("/sys/devices/platform");
+    if (!dir) return -1;
+
+    struct dirent *entry;
+    int found = -1;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "evdi.", 5) != 0)
+            continue;
+
+        char drm_path[256];
+        snprintf(drm_path, sizeof(drm_path), "/sys/devices/platform/%s/drm", entry->d_name);
+
+        DIR *drm_dir = opendir(drm_path);
+        if (!drm_dir) continue;
+
+        struct dirent *drm_entry;
+        while ((drm_entry = readdir(drm_dir)) != NULL) {
+            if (strncmp(drm_entry->d_name, "card", 4) != 0)
+                continue;
+            int card = atoi(drm_entry->d_name + 4);
+            if (card > 0) {
+                found = card;
+            }
+        }
+        closedir(drm_dir);
+        if (found >= 0) break;
+    }
+    closedir(dir);
+    return found;
+}
+
+static int wait_for_device(int timeout_ms) {
+    int waited = 0;
+    const int step = 100;
+    while (waited < timeout_ms) {
+        int idx = find_evdi_device();
+        if (idx >= 0) return idx;
+        usleep(step * 1000);
+        waited += step;
+    }
+    return -1;
+}
+
+int main(int argc, char *argv[]) {
+    const char *edid_path = NULL;
+    const char *fifo_path = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--edid") == 0 && i + 1 < argc) {
+            edid_path = argv[++i];
+        } else if (strcmp(argv[i], "--capture-fifo") == 0 && i + 1 < argc) {
+            fifo_path = argv[++i];
+        } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            g_scale = atoi(argv[++i]);
+            if (g_scale < 1) g_scale = 1;
+            if (g_scale > 4) g_scale = 4;
+        } else if (strcmp(argv[i], "--card") == 0 && i + 1 < argc) {
+            /* Pin a specific EVDI card. With several virtual displays each
+               helper must own its own; find_evdi_device() would hand every
+               one of them the same card. */
+            g_pin_card = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+            g_fps = atoi(argv[++i]);
+            if (g_fps < 1 || g_fps > 240) g_fps = 60;
+        }
+    }
+
+    if (!edid_path) {
+        fprintf(stderr, "Usage: %s --edid <edid.bin> [--capture-fifo <path>] [--fps <n>] [--scale <1-4>]\n", argv[0]);
+        return 1;
+    }
+
+    {
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+        pthread_cond_init(&g_frame_ready, &ca);
+        pthread_condattr_destroy(&ca);
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Reuse an existing EVDI device if one is free (e.g. from a previous
+       run) — adding a new DRM card on every restart floods the compositor
+       with display hotplug events. */
+    evdi_handle handle = EVDI_INVALID_HANDLE;
+    int dev_idx = g_pin_card >= 0 ? g_pin_card : find_evdi_device();
+    if (dev_idx >= 0) {
+        handle = evdi_open(dev_idx);
+        if (handle != EVDI_INVALID_HANDLE) {
+            fprintf(stderr, "[evdi-helper] Reusing EVDI device /dev/dri/card%d\n", dev_idx);
+        }
+    }
+
+    if (handle == EVDI_INVALID_HANDLE) {
+        fprintf(stderr, "[evdi-helper] Creating EVDI device...\n");
+        int written = evdi_add_device();
+        if (written < 0) {
+            fprintf(stderr, "[evdi-helper] Failed to add EVDI device (err=%d)\n", written);
+            return 1;
+        }
+
+        fprintf(stderr, "[evdi-helper] Waiting for EVDI device...\n");
+        dev_idx = wait_for_device(5000);
+        if (dev_idx < 0) {
+            fprintf(stderr, "[evdi-helper] EVDI device did not appear within timeout.\n"
+                            "[evdi-helper] Either the evdi kernel module is not loaded, or no device exists\n"
+                            "[evdi-helper] and /sys/devices/evdi/add is root-only. Check `lsmod | grep evdi`;\n"
+                            "[evdi-helper] then, once: echo 'options evdi initial_device_count=2' | sudo tee /etc/modprobe.d/uscreen-evdi.conf\n"
+                            "[evdi-helper]            sudo modprobe -r evdi; sudo modprobe evdi   (or reboot)\n"
+                            "[evdi-helper] The packages and install.sh do this — unless evdi-dkms failed to build, see docs/installation.md.\n");
+            return 1;
+        }
+        fprintf(stderr, "[evdi-helper] Found EVDI device at /dev/dri/card%d\n", dev_idx);
+
+        handle = evdi_open(dev_idx);
+        if (handle == EVDI_INVALID_HANDLE) {
+            fprintf(stderr, "[evdi-helper] Failed to open EVDI device /dev/dri/card%d\n", dev_idx);
+            return 1;
+        }
+    }
+    g_device_index = dev_idx;
+    g_handle = handle;
+
+    FILE *f = fopen(edid_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[evdi-helper] Failed to open EDID file: %s\n", edid_path);
+        evdi_close(handle);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long edid_size = ftell(f);
+    if (edid_size <= 0 || edid_size > 32768) {
+        fprintf(stderr, "[evdi-helper] Invalid EDID size: %ld\n", edid_size);
+        fclose(f);
+        evdi_close(handle);
+        return 1;
+    }
+    fseek(f, 0, SEEK_SET);
+    unsigned char *edid = malloc((size_t)edid_size);
+    if (!edid) {
+        fprintf(stderr, "[evdi-helper] Failed to allocate EDID buffer\n");
+        fclose(f);
+        evdi_close(handle);
+        return 1;
+    }
+    size_t read_bytes = fread(edid, 1, (size_t)edid_size, f);
+    fclose(f);
+    if ((long)read_bytes != edid_size) {
+        fprintf(stderr, "[evdi-helper] EDID read error: got %zu of %ld bytes\n", read_bytes, edid_size);
+        free(edid);
+        evdi_close(handle);
+        return 1;
+    }
+
+    fprintf(stderr, "[evdi-helper] Connecting with EDID (%ld bytes)...\n", edid_size);
+    evdi_connect(handle, edid, (unsigned int)edid_size, 0);
+    free(edid);
+
+    printf("EVDI_CONNECTED card%d\n", dev_idx);
+    fflush(stdout);
+
+    pthread_t writer = 0;
+    if (fifo_path) {
+        g_fifo_path = fifo_path;
+        conv_pool_init();   /* spawn NV12 conversion workers before first grab */
+        fprintf(stderr, "[evdi-helper] Capture FIFO: %s (opened on demand)\n", fifo_path);
+        if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
+            fprintf(stderr, "[evdi-helper] Failed to start writer thread\n");
+            return 1;
+        }
+    }
+
+    fprintf(stderr, "[evdi-helper] Connected. Capture at %d fps. Entering event loop.\n", g_fps);
+    run_event_loop(handle);
+
+    g_running = 0;
+    /* Wake the writer out of its condition wait so shutdown is immediate
+       rather than up to one frame period late. */
+    pthread_mutex_lock(&g_swap_mutex);
+    pthread_cond_broadcast(&g_frame_ready);
+    pthread_mutex_unlock(&g_swap_mutex);
+    if (writer) pthread_join(writer, NULL);
+    if (g_capture_fifo_fd >= 0) close(g_capture_fifo_fd);
+    free(g_framebuffer);
+    free(g_fill);
+    free(g_latest);
+    free(g_write);
+    free(g_dirty_fill);
+    free(g_dirty_latest);
+    free(g_dirty_write);
+
+    fprintf(stderr, "[evdi-helper] Disconnecting...\n");
+    evdi_disconnect(handle);
+    evdi_close(handle);
+    g_handle = EVDI_INVALID_HANDLE;
+
+    fprintf(stderr, "[evdi-helper] Done.\n");
+    return 0;
+}

@@ -1,0 +1,61 @@
+# UScreen, forked: same app on the tablet, a different capture path on the host.
+#
+# Upstream UScreen grabs frames from an EVDI virtual display, which can only
+# hand out system memory: the driver copies 22.5 MB per frame, the helper
+# converts it on the CPU, and at 3000x1872 that measured 154% of a core and
+# capped the stream at ~32 fps. This fork keeps everything above and below that
+# stage — the tablet APK with touch and pen, the transport, the settings window
+# — and replaces the capture with the compositor's DMA-BUFs over
+# `ext-image-copy-capture`, encoded on the GPU: 59 fps at 2400x1500 for 12% of
+# one core.
+#
+# The EVDI path is still there as a fallback (`capture = "evdi"`), which is why
+# evdi remains a dependency.
+#
+# Built from this repository's `uscreen/` directory rather than a tarball: the
+# fork *is* the source, and `vendor/` carries the two capture/encode crates it
+# borrowed from moreland (Apache-2.0, patched to ask Intel's vapostproc for
+# AR24 — it does not accept XR24 at all).
+
+pkgname=uscreen-dmabuf
+_pkgname=uscreen
+pkgver=1.2.12
+pkgrel=2
+pkgdesc="Android tablet as a USB second display (fork: DMA-BUF capture and niri virtual outputs, no CPU copy)"
+arch=('x86_64')
+url="https://github.com/majmichu1/UScreen"
+license=('MIT')
+depends=('evdi-dkms' 'ffmpeg' 'android-tools'
+         'gstreamer' 'gst-plugins-base' 'gst-plugins-bad' 'gst-plugin-va' 'libva')
+makedepends=('cargo' 'gcc' 'pkgconf')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+# pacman only applies `replaces` when the new package is *newer*, so pkgrel
+# must go up whenever this replaces the stock uscreen of the same version.
+replaces=("$_pkgname")
+install=uscreen.install
+
+build() {
+  cd "$startdir"
+  # The EVDI fallback helper, against the system libevdi that evdi-dkms ships.
+  gcc -O3 -o host/evdi/evdi_helper host/evdi/evdi_helper.c host/evdi/uscreen_convert.c \
+      -levdi -lpthread -Ihost/evdi
+  cargo build --release --locked -p uscreen -p uscreen-gui
+}
+
+package() {
+  cd "$startdir"
+  install -Dm755 target/release/uscreen     "$pkgdir/usr/bin/uscreen"
+  install -Dm755 target/release/uscreen-gui "$pkgdir/usr/bin/uscreen-gui"
+  install -Dm755 host/evdi/evdi_helper      "$pkgdir/usr/lib/uscreen/evdi_helper"
+  install -Dm644 scripts/uscreen.desktop    "$pkgdir/usr/share/applications/uscreen.desktop"
+  install -Dm644 packaging/icons/uscreen.svg     "$pkgdir/usr/share/icons/hicolor/scalable/apps/uscreen.svg"
+  install -Dm644 packaging/icons/uscreen-pen.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/uscreen-pen.svg"
+  install -Dm644 packaging/uscreen.service  "$pkgdir/usr/lib/systemd/user/uscreen.service"
+  install -Dm644 packaging/uscreen-evdi.conf "$pkgdir/usr/lib/modprobe.d/uscreen-evdi.conf"
+  install -Dm644 packaging/uscreen-modules.conf "$pkgdir/usr/lib/modules-load.d/uscreen.conf"
+  install -Dm644 packaging/60-uscreen-uinput.rules "$pkgdir/usr/lib/udev/rules.d/60-uscreen-uinput.rules"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
+  # The vendored crates are Apache-2.0 and must keep their notices.
+  install -Dm644 vendor/README.md "$pkgdir/usr/share/doc/$pkgname/vendor-README.md"
+}

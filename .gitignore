@@ -1,0 +1,15 @@
+# build output
+niri/src/
+niri/pkg/
+niri/*.pkg.tar.zst
+uscreen/target/
+uscreen/pkg/
+uscreen/*.pkg.tar.zst
+moreland/
+tmp/
+# caches
+__pycache__/
+*.pyc
+niri/*.bin
+niri/niri/
+niri/pkg/
