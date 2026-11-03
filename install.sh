@@ -88,9 +88,13 @@ install_pkg() {
     # `--noconfirm` answers "no" to, aborting the transaction. Removing the
     # old name first makes the transition deterministic.
     for stale in "${stale_names[@]}"; do
-        if pacman -Q "$stale" >/dev/null 2>&1; then
+        # `pacman -Q name` also answers for a package that merely *provides*
+        # that name: it found "uscreen" behind uscreen-dmabuf and then asked
+        # pacman to remove a target that does not exist, which aborted the
+        # install. Only a real package name counts.
+        if pacman -Qq | grep -qx "$stale"; then
             say "removing the package this replaces: $stale"
-            sudo pacman -Rdd --noconfirm "$stale"
+            sudo pacman -Rdd --noconfirm "$stale" || true
         fi
     done
     ( cd "$dir" && makepkg -si --noconfirm )
