@@ -1025,6 +1025,7 @@ impl CaptureManager {
                 display_rx,
                 shutdown_rx,
                 self.codec_config.clone(),
+                self.idr_request_flag(),
                 self.latency.clone(),
             )
             .await;

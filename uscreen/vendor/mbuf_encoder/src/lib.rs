@@ -331,6 +331,20 @@ impl Encoder {
         Ok(())
     }
 
+    /// Ask the encoder to make the next frame an IDR.
+    ///
+    /// This is a `FORCE_KEY_UNIT` event pushed ahead of the buffer, so it stays
+    /// ordered with that frame even though the encoder runs on its own thread.
+    /// `all_headers` also refreshes SPS/PPS, which a client that just attached
+    /// has not seen. Returns `false` if the pipeline refused the event.
+    pub fn force_keyframe(&self) -> bool {
+        let event = gstreamer_video::DownstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .count(0)
+            .build();
+        self.appsrc.send_event(event)
+    }
+
     /// Pull the next encoded access unit, waiting up to `timeout`.
     pub fn pull_packet(&self, timeout: Duration) -> Result<Option<EncodedPacket>> {
         let sample = match self

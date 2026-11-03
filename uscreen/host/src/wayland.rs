@@ -48,6 +48,7 @@ pub async fn stream_frames(
     mut display_rx: watch::Receiver<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
     codec_config: Arc<Mutex<Option<bytes::Bytes>>>,
+    idr_wanted: Arc<AtomicBool>,
     latency: crate::latency::LatencyTracker,
 ) -> Result<()> {
     let mut error_backoff = Duration::from_millis(500);
@@ -125,6 +126,7 @@ pub async fn stream_frames(
         let settings_thread = settings.clone();
         let tx_thread = tx.clone();
         let codec_thread = codec_config.clone();
+        let idr_thread = idr_wanted.clone();
         let latency_thread = latency.clone();
 
         let mut handle = tokio::task::spawn_blocking(move || {
@@ -133,6 +135,7 @@ pub async fn stream_frames(
                 &settings_thread,
                 tx_thread,
                 codec_thread,
+                idr_thread,
                 latency_thread,
                 stop_thread,
             )
@@ -199,6 +202,7 @@ fn run_pipeline(
     settings: &EncoderSettings,
     tx: broadcast::Sender<VideoPacket>,
     codec_config: Arc<Mutex<Option<bytes::Bytes>>>,
+    idr_wanted: Arc<AtomicBool>,
     latency: crate::latency::LatencyTracker,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -298,7 +302,67 @@ fn run_pipeline(
     let mut last_report = std::time::Instant::now();
     let mut sent: u64 = 0;
 
-    while let Ok(job) = frame_rx.recv() {
+    // A client cannot decode anything until it sees a keyframe, and on a still
+    // screen the scheduled one can be minutes away: this encoder counts
+    // keyframes in frames (`key-int-max`), while niri may capture only a few
+    // per second when nothing moves. The tablet gives up after 10 s without a
+    // byte (`VideoReceiver.kt`, `soTimeout`) and reconnects, which is what
+    // looked like the connection dropping "by itself". Re-submitting the last
+    // frame serves both needs: when `idr_wanted` is set it becomes the
+    // keyframe the new client is waiting for, otherwise it is a keepalive.
+    // A static frame costs a fraction of a millisecond to encode.
+    const KEEPALIVE: Duration = Duration::from_secs(2);
+    let mut last_job: Option<FrameJob> = None;
+    let mut last_submit = std::time::Instant::now();
+    let mut keepalive_pts: u64 = 0;
+
+    loop {
+        let job = match frame_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(job) => {
+                keepalive_pts = job.pts_ns;
+                if let Ok(fd) = job.fd.try_clone() {
+                    last_job = Some(FrameJob {
+                        fd,
+                        offset: job.offset,
+                        stride: job.stride,
+                        pts_ns: job.pts_ns,
+                    });
+                }
+                job
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Nobody to keep alive and nobody waiting for a keyframe: do
+                // not consume a pending IDR request here.
+                if tx.receiver_count() == 0 {
+                    continue;
+                }
+                let Some(job) = last_job.as_ref() else {
+                    continue;
+                };
+                if !idr_wanted.load(Ordering::Relaxed) && last_submit.elapsed() < KEEPALIVE {
+                    continue;
+                }
+                // A fresh, monotonic PTS: the same frame is being resubmitted,
+                // not shown at the time it was captured.
+                keepalive_pts = keepalive_pts.saturating_add(1_000_000_000);
+                FrameJob {
+                    fd: job.fd.try_clone()?,
+                    offset: job.offset,
+                    stride: job.stride,
+                    pts_ns: keepalive_pts,
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        last_submit = std::time::Instant::now();
+
+        // Ordered with the buffer below, so the encoder cannot miss it even
+        // though it runs on its own thread.
+        if idr_wanted.swap(false, Ordering::Relaxed) && !encoder.force_keyframe() {
+            warn!("encoder refused the force-key-unit event");
+        }
+
         encoder
             .push_frame(job.fd.as_fd(), job.offset, job.stride, job.pts_ns)
             .context("handing the frame to the encoder")?;
