@@ -214,6 +214,18 @@ PluginComponent {
                 }
 
                 StyledText {
+                    width: parent.width
+                    text: root.screenState === "absent"
+                        ? "Connect the tablet over USB and open the UScreen app on it."
+                        : (root.isOn
+                            ? "The tablet is a virtual output: windows can be moved to it and touch/pen follow it."
+                            : "The virtual output is removed. Nothing is rendered, captured or sent until it is turned on again.")
+                    color: Theme.surfaceVariantText
+                    font.pixelSize: Theme.fontSizeSmall
+                    wrapMode: Text.WordWrap
+                }
+
+                StyledText {
                     text: "Mode (applied live)"
                     color: Theme.surfaceVariantText
                     font.pixelSize: Theme.fontSizeSmall
